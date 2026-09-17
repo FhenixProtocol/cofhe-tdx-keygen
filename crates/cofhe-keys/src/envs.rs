@@ -113,10 +113,10 @@ const TESTNET: EnvConfig = EnvConfig {
 /// stack in its own GCP project, and reconstructing a secret needs 3 of the 6, so no
 /// single operator holds a usable secret.
 ///
-/// INCOMPLETE: partners 5-6 are `FILL-ME-` placeholders, pending the last two
-/// project numbers. While any remain, [`EnvConfig::ensure_partners_complete`] fails,
+/// INCOMPLETE: partner 6 is a `FILL-ME-` placeholder, pending the last project
+/// number. While it remains, [`EnvConfig::ensure_partners_complete`] fails,
 /// which blocks both the ceremony ([`crate::envs`] consumers call it at config build)
-/// and the read side ([`crate::reader::partner_refs`]). Filling the three slots needs
+/// and the read side ([`crate::reader::partner_refs`]). Filling the remaining slot needs
 /// no other edit: N, T and the tests are already at their final shape.
 ///
 /// Every slot is one operator, one project, and all six are treated identically here.
@@ -151,9 +151,9 @@ const MAINNET: EnvConfig = EnvConfig {
             keygen_write_audience: "//iam.googleapis.com/projects/772683464839/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
         },
         EnvPartner {
-            project_id: "FILL-ME-PARTNER-5",
-            wip_pool_audience: "//iam.googleapis.com/projects/FILL-ME-PROJECT-NUMBER-5/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
-            keygen_write_audience: "//iam.googleapis.com/projects/FILL-ME-PROJECT-NUMBER-5/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
+            project_id: "validator-fhenix",
+            wip_pool_audience: "//iam.googleapis.com/projects/581791888267/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
+            keygen_write_audience: "//iam.googleapis.com/projects/581791888267/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
         },
         EnvPartner {
             project_id: "FILL-ME-PARTNER-6",
