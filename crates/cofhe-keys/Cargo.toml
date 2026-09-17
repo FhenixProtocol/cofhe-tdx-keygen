@@ -1,0 +1,83 @@
+[package]
+name = "cofhe-keys"
+version = "0.1.0"
+edition = "2021"
+license-file = "../../LICENSE"
+publish = false
+
+# Portable key-distribution core. Consumers (ZeeK Verifier, TeeCryptor) depend on
+# this crate for the read + verify + canonical-format path; the keygen binary
+# depends on it for the write side. Single source of truth for the wire format so
+# writer and reader hash byte-identical material.
+[lib]
+name = "cofhe_keys"
+path = "src/lib.rs"
+
+[features]
+# `writer` is the in-enclave keygen write path (keygen, serialization, write-side
+# gcs/secrets, tfhe); `reader` is the consumer read path (reader — fetch shares +
+# public material, then Shamir-reconstruct and validate against published digests).
+# Default keeps both so plain `cargo build`, tests, and consumers get everything.
+default = ["writer", "reader"]
+# tfhe (+ its zk-pok pin) is a heavy compile used ONLY by the write-side `keygen`
+# module, so it is pulled in by `writer` alone. Reader-only consumers (TeeCryptor,
+# ZeeK) build with `default-features = false, features = ["reader"]` and never
+# compile tfhe — the reader path treats FHE material as opaque bytes.
+writer = ["dep:tfhe", "dep:tfhe-zk-pok"]
+reader = ["dep:futures", "dep:tokio"]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+# Shamir over GF(256). We call `Gf256::split_array`/`combine_array`, always
+# supplying our own OS-seeded CSPRNG (never an internal `thread_rng()`).
+# `default-features = false` drops the bigint/primitive/serde backends we don't
+# use; `zeroize` is kept for the field/share types. On ephemeral secret handling
+# in the enclave, see DESIGN.md §10.
+vsss-rs = { version = "5.4", default-features = false, features = ["std", "zeroize"] }
+# Read-side only: `futures::future::join_all` for the fault-tolerant fetch-all-N
+# gather (every partner resolves, one failure never aborts the batch). Gated
+# behind `reader` so the enclave `keygen` writer build keeps it out of the TCB.
+futures = { version = "0.3", optional = true }
+hex = "0.4"
+# Percent-encode the object name into the GCS download URL path. Object names now
+# contain `/` (keys/versionized/{zone}/…); an unencoded slash would change the URL
+# path structure and hit the wrong resource.
+percent-encoding = "2"
+k256 = { version = "0.13", features = ["ecdsa"] }
+rand_chacha = "0.3"
+rand_core = { version = "0.6", features = ["std"] }
+# `rustls-tls-manual-roots-no-provider` (not `rustls-tls`): the plain feature
+# would pull rustls's `ring` provider into every consumer's tree next to
+# aws-lc-rs, arming the two-providers lazy-init panic for any consumer code
+# that relies on the process default. Roots and provider are supplied
+# explicitly by `crate::tls`.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-manual-roots-no-provider"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sha3 = "0.10"
+# Write-side only (gated behind `writer`): the `keygen` module generates + safe-
+# serializes the FHE keyset. Optional so reader-only consumers skip this heavy compile.
+tfhe = { version = "=1.5.1", features = ["integer", "zk-pok"], optional = true }
+# Read-side only: `tokio::time::timeout` for the per-partner read-gather timeout.
+# Gated behind `reader` so the enclave `keygen` writer build keeps it out of the TCB.
+tokio = { version = "1", features = ["time"], optional = true }
+# Pin transitive: tfhe-zk-pok 0.8.2 drags in tfhe-versionable 0.8.0 (skewing
+# against tfhe's own 0.7.0 and breaking the build). 0.8.0 is what TN/fhe-engine
+# resolve and keeps the tree on a single tfhe-versionable 0.7.0. Optional +
+# gated behind `writer` alongside tfhe (only pulled when tfhe is).
+tfhe-zk-pok = { version = "=0.8.0", optional = true }
+tracing = "0.1"
+zeroize = { version = "1", features = ["derive", "zeroize_derive"] }
+# Floor 0.23.22 (X25519MLKEM768 default-enabled in the aws-lc-rs provider), not
+# the latest patch: consumers pin exact rustls 0.23.x versions and a higher
+# floor here would make their resolution unsatisfiable.
+rustls = { version = "0.23.22", default-features = false, features = ["aws_lc_rs", "std", "logging"] }
+webpki-roots = "1.0.9"
+
+[dev-dependencies]
+rcgen = "0.14.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-rustls = "0.26.4"
+wiremock = "0.6"

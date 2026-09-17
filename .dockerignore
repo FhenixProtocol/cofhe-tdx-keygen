@@ -1,0 +1,10 @@
+# Local docker/buildx build context — only Cargo.toml, Cargo.lock, src/ are
+# COPYed by the Dockerfile. Keep the context small.
+.git/
+target/
+terraform/
+**/.terraform/
+*.tfstate
+*.tfstate.*
+.DS_Store
+**/.DS_Store

@@ -1,0 +1,217 @@
+name: Build & sign keygen TDX image
+
+# This workflow builds the keygen image. It pushes the image to the shared
+# fhenix-artifacts-registry project, repo cofhe-tee-keygen. It uses GitHub
+# Actions Workload Identity Federation. There is NO long-lived GCP key.
+#
+# The WIF pool, the provider and the keygen-publisher SA live in
+# fhenix-artifacts-registry. An operator creates them manually, as for
+# teecryptor and zee-k-verifier. This repo's terraform does NOT create them.
+#
+# The provider CEL pins this repo and this workflow's job_workflow_ref. Thus a
+# new file name breaks the federation. A run from a different ref also breaks
+# it. The federation stays broken until an operator updates the CEL.
+#
+# The auth step reads three non-secret repo variables: KEYGEN_WIF_PROVIDER,
+# KEYGEN_PUBLISHER_SA and KEYGEN_IMAGE_REGISTRY.
+#
+# Cosign gives supply-chain provenance only. The PARTNER gate pins the
+# image_digest. It does not pin the Cosign fingerprint. See DESIGN.md
+# paragraph 11 to paragraph 13. Thus this file does NOT add the
+# Confidential-Space key_id annotations. That is deliberate.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag (e.g. v1, v2.0.1, dev-myname)"
+        required: true
+        type: string
+
+# A Confidential Space VM accepts linux/amd64 only.
+permissions:
+  contents: read
+  actions: read # read the ci.yml workflow runs for this commit
+  id-token: write # OIDC → GCP WIF
+  attestations: write # SLSA build provenance. This is a stub. It is off. See below.
+
+env:
+  PLATFORM: linux/amd64
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # DECISION (2026-06-21): Cosign signing is DEFERRED. This gate is OFF by
+    # default. Our partner CEL pins the image DIGEST. It does not pin a
+    # signature. Thus a signature gates nothing. teecryptor is our digest-pin
+    # twin. It made the same decision. The build and the push work without a
+    # signature.
+    #
+    # To enable signing later, set the SHARED Fhenix Cosign key as two secrets:
+    # COSIGN_PRIVATE_KEY and COSIGN_PASSWORD. Use the same org key as teecryptor
+    # and zk. Do NOT make a new key for this repo. The signing steps below then
+    # run. See DESIGN.md paragraph 13.
+    env:
+      HAS_COSIGN: ${{ secrets.COSIGN_PRIVATE_KEY != '' }}
+      # SLSA build provenance is a STUB. It is OFF by default. It makes a
+      # signed attestation of the builder identity and the source. This becomes
+      # useful when the repo goes public. An external consumer can then verify
+      # the origin of the image. To turn it on, set the repo variable
+      # ENABLE_SLSA to "true". See DESIGN.md paragraph 13.
+      ENABLE_SLSA: ${{ vars.ENABLE_SLSA }}
+
+    steps:
+      # The image digest goes into the partner attestation CEL. The same image
+      # runs the key ceremony. Thus this job must not build a commit that has a
+      # red CI run. A branch rule is not sufficient. A user can start this job
+      # while CI still runs. A user can also start it after CI fails. This step
+      # runs first. A red commit gets no GCP credentials. It writes nothing to
+      # the registry.
+      #
+      # The step reads the workflow-runs API. It does not read the check-runs
+      # API. GitHub does not authenticate a check-run name. Any user with write
+      # access can POST a check run. That user sets the name "ci" and the
+      # conclusion "success" on any SHA. A gate that matches the name accepts
+      # it. A workflow run exists only after Actions runs ci.yml. GitHub sets
+      # the event, branch and conclusion fields. The caller cannot set them.
+      - name: Require green CI on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+          CI_WORKFLOW: ci.yml
+        run: |
+          set -euo pipefail
+          # The WIF provider CEL pins this workflow to main. That CEL lives in
+          # GCP, not in this repo. Test the branch here also. ci.yml runs on
+          # pull_request too. Without this test, a PR head passes the gate.
+          if [ "${REF}" != "refs/heads/main" ]; then
+            echo "::error::this job runs from refs/heads/main only. Got ${REF}"
+            exit 1
+          fi
+          # The filter tests head_sha again on the client. GitHub ignores a
+          # query parameter that it does not know. A typo in the parameter name
+          # widens the query to every run on main. The gate then accepts any
+          # green commit. Measured: "?sha=" returns 100 runs. "?head_sha="
+          # returns 1.
+          run_ids="$(gh api --paginate \
+            "repos/${REPO}/actions/workflows/${CI_WORKFLOW}/runs?head_sha=${SHA}&per_page=100" \
+            --jq '.workflow_runs[]
+                  | select(.head_sha == env.SHA and .event == "push"
+                           and .head_branch == "main" and .status == "completed"
+                           and .conclusion == "success")
+                  | .id')"
+          run_id="${run_ids%%$'\n'*}"
+          if [ -z "${run_id}" ]; then
+            echo "::error::no green push run of ${CI_WORKFLOW} on main for commit ${SHA}"
+            echo "::error::this job does not build a commit without a green CI run"
+            exit 1
+          fi
+          # A run concludes "success" when every job succeeds OR SKIPS. Thus
+          # the run conclusion does not prove that the gates ran. One "if:" on a
+          # job empties this gate. The gate still reports green. Thus each job
+          # must conclude "success". This test reads conclusions, not job names.
+          # No list here tracks ci.yml.
+          not_green="$(gh api --paginate \
+            "repos/${REPO}/actions/runs/${run_id}/jobs?per_page=100" \
+            --jq '.jobs[] | select(.conclusion != "success")
+                  | "\(.name) concluded \(.conclusion)"')"
+          if [ -n "${not_green}" ]; then
+            echo "::error::CI run ${run_id} has a job that did not pass:"
+            echo "${not_green}"
+            echo "::error::this job does not build a commit without a green CI run"
+            exit 1
+          fi
+          echo "Green CI for ${SHA}: run ${run_id}"
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Authenticate to GCP via Workload Identity Federation
+        id: auth
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          # The job impersonates the keyless publisher SA. No key exists for it.
+          # The auth action makes an access token by SA impersonation only.
+          workload_identity_provider: ${{ vars.KEYGEN_WIF_PROVIDER }}
+          service_account: ${{ vars.KEYGEN_PUBLISHER_SA }}
+          # This value must match the provider allowed_audiences. GCP uses the
+          # "no-scheme" URI form.
+          audience: //iam.googleapis.com/${{ vars.KEYGEN_WIF_PROVIDER }}
+          token_format: access_token
+
+      - name: Log in to Artifact Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ${{ vars.KEYGEN_IMAGE_REGISTRY }}
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ env.PLATFORM }}
+          push: true
+          tags: ${{ vars.KEYGEN_IMAGE_REGISTRY }}:${{ inputs.tag }}
+          provenance: false
+
+      - name: Install Cosign
+        if: env.HAS_COSIGN == 'true'
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
+
+      - name: Sign image with Cosign (private — no transparency log)
+        if: env.HAS_COSIGN == 'true'
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          REGISTRY: ${{ vars.KEYGEN_IMAGE_REGISTRY }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # --tlog-upload=false keeps the signature out of the public Sigstore
+          # log, which is Rekor. This repo is private. Cosign attaches the
+          # signature to the image in our registry. The public key verifies it.
+          cosign sign --yes --tlog-upload=false \
+            --key env://COSIGN_PRIVATE_KEY \
+            "${REGISTRY}@${DIGEST}"
+
+      # SLSA build provenance. This is a STUB. It is OFF while ENABLE_SLSA is
+      # not "true". When the repo goes public, set the repo variable ENABLE_SLSA
+      # to "true". This step then emits a signed provenance attestation for the
+      # pushed image digest.
+      - name: Attest SLSA build provenance
+        if: env.ENABLE_SLSA == 'true'
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-name: ${{ vars.KEYGEN_IMAGE_REGISTRY }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Summarize
+        env:
+          REGISTRY: ${{ vars.KEYGEN_IMAGE_REGISTRY }}
+          TAG: ${{ inputs.tag }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          SIGNED: ${{ env.HAS_COSIGN }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## keygen image built"
+            echo
+            echo "**Tag:** \`${TAG}\`  ·  **Signed:** \`${SIGNED}\`"
+            echo
+            echo "**Digest:**"
+            echo '```'
+            echo "${DIGEST}"
+            echo '```'
+            echo "**Pin it on the partner side** (key-share-holders values.tfvars):"
+            echo '```hcl'
+            echo "image_digest = \"${DIGEST}\""
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

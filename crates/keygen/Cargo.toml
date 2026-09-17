@@ -1,0 +1,53 @@
+[package]
+name = "keygen"
+version = "0.1.0"
+edition = "2021"
+license-file = "../../LICENSE"
+publish = false
+
+# The write-side TEE service: the one-shot in-enclave keygen ceremony (default
+# bin `keygen`) and the `verify` acceptance CLI. Depends on the portable
+# `cofhe-keys` lib for the keyset, serialization, and the reader.
+[[bin]]
+name = "keygen"
+path = "src/main.rs"
+
+[[bin]]
+name = "verify"
+path = "src/bin/verify.rs"
+required-features = ["verify"]
+
+# Tooling-only: prints the baked per-env public-material map as JSON for the CI
+# TF↔reader drift check. Needs the reader side (behind `verify`), so it is skipped
+# in the image build (`--bin keygen --no-default-features`) where reader is absent.
+[[example]]
+name = "emit_public_material"
+required-features = ["verify"]
+
+[features]
+# Default keeps `verify` so plain `cargo build`/`cargo test` build the acceptance
+# CLI; the enclave image builds `--bin keygen --no-default-features` to leave the
+# read path (Secret Manager / GCS fetch + reconstruct) out of the write-side TCB.
+default = ["verify"]
+# Local-dev only: skip the TDX attestation + Secret Manager chain and generate
+# keys in-process so the service runs without GCP/TDX. Never ship.
+mock = []
+# The `verify` acceptance CLI; pulls the `cofhe-keys` read/verify side.
+verify = ["cofhe-keys/reader"]
+
+[dependencies]
+cofhe-keys = { path = "../cofhe-keys", default-features = false, features = ["writer"] }
+anyhow = "1"
+hex = "0.4"
+# Same feature rationale as cofhe-keys: no bundled provider/roots — the ring
+# provider must stay out of the tree so aws-lc-rs is the unambiguous default.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-manual-roots-no-provider"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"

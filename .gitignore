@@ -1,0 +1,20 @@
+/target
+**/.terraform/
+**/terraform.tfvars
+*.tfstate
+*.tfstate.*
+/key1.bin
+/key2.bin
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Personal / scratch files — never committed
+local/
+docs/superpowers/
+
+# Claude Code — per-machine state (settings.json and check-plugins.py are shared)
+.claude/settings.local.json
+.claude/tmp/
+.claude/worktrees/

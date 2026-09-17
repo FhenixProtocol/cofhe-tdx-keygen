@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      # `rustup show` reads rust-toolchain.toml and installs the pinned channel.
+      # The version source of truth stays in rust-toolchain.toml, not here.
+      - name: Install toolchain
+        run: rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: build
+        run: cargo build --workspace --release
+
+      # The enclave image builds the keygen binary with cofhe-keys `writer` only
+      # (reader stripped) — a profile the workspace build above never exercises.
+      # This runs the exact Dockerfile command so a writer-only feature
+      # hole fails CI here, not at image-build/ceremony time (regression guard for
+      # the break fixed by moving the baked env source into the unconditional
+      # `cofhe_keys::envs` module).
+      - name: build (writer-only image profile)
+        run: cargo build --locked --bin keygen --no-default-features
+
+      - name: test
+        run: cargo test --workspace
+
+      # The per-env public bucket/prefix live in cofhe_keys::envs (baked truth);
+      # terraform/service mirrors them in `local.public_material`. This step fails
+      # the build if the mirror drifts — a prefix drift is silent-security (it scopes
+      # the consumer read grant). See scripts/check-tf-reader-drift.sh.
+      - name: Install terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_wrapper: false
+
+      - name: reader.rs ↔ terraform public-material drift
+        run: ./scripts/check-tf-reader-drift.sh
+
+  # Full-history secret scan. History is clean at publication; this gate keeps
+  # every commit clean after the repo is public.
+  secret-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # only used by the public-gated SARIF upload below
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+      - name: Run gitleaks
+        run: |
+          curl -sSfL -o gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks git --no-banner --redact --report-format sarif --report-path results.sarif --exit-code 1 .
+      # Surface findings in the Security tab and as PR annotations. This is free
+      # code scanning on public repos; private repos need paid GHAS for it, so
+      # it stays gated off until the repo is public. The scan above blocks the
+      # merge on a leak either way — always() runs the upload even when it did.
+      - name: Upload gitleaks SARIF
+        if: always() && github.event.repository.visibility == 'public'
+        uses: github/codeql-action/upload-sarif@6f5948dfacef28e207b48d0905cf90c03365536d # v3
+        with:
+          sarif_file: results.sarif

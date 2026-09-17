@@ -1,0 +1,10 @@
+# Cloud Build upload context — only Cargo.toml, Cargo.lock, src/, Dockerfile are
+# needed to build the image. Exclude everything heavy/irrelevant.
+.git/
+target/
+terraform/
+**/.terraform/
+*.tfstate
+*.tfstate.*
+.DS_Store
+**/.DS_Store

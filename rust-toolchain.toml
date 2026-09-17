@@ -1,0 +1,5 @@
+[toolchain]
+# Pinned >= tfhe 1.5.1 MSRV (1.91.1); matches the Dockerfile build image.
+# CI installs this via `rustup show`; the version source of truth lives here.
+channel = "1.94"
+components = ["rustfmt", "clippy"]
