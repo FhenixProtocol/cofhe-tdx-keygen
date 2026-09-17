@@ -1,4 +1,5 @@
 name: Build & sign keygen TDX image
+run-name: Build & sign keygen TDX image — ${{ inputs.tag }}
 
 # This workflow builds the keygen image. It pushes the image to the shared
 # fhenix-artifacts-registry project, repo cofhe-tee-keygen. It uses GitHub
