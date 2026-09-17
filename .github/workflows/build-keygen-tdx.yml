@@ -16,10 +16,12 @@ run-name: Build & sign keygen TDX image — ${{ inputs.tag }}
 # The auth step reads three non-secret repo variables: KEYGEN_WIF_PROVIDER,
 # KEYGEN_PUBLISHER_SA and KEYGEN_IMAGE_REGISTRY.
 #
-# Cosign gives supply-chain provenance only. The PARTNER gate pins the
-# image_digest. It does not pin the Cosign fingerprint. See DESIGN.md
-# paragraph 11 to paragraph 13. Thus this file does NOT add the
-# Confidential-Space key_id annotations. That is deliberate.
+# The job signs the pushed digest with keyless Cosign. It also attests SLSA
+# build provenance. Both use this workflow's OIDC token. Both go to the public
+# Rekor log. No signing key exists.
+#
+# The runtime gate does not change. The partner CEL pins the image_digest only.
+# The partner checks the signature at PIN time. See DESIGN.md paragraph 13.
 
 on:
   workflow_dispatch:
@@ -34,7 +36,7 @@ permissions:
   contents: read
   actions: read # read the ci.yml workflow runs for this commit
   id-token: write # OIDC → GCP WIF
-  attestations: write # SLSA build provenance. This is a stub. It is off. See below.
+  attestations: write # SLSA build provenance → Fulcio + public Rekor
 
 env:
   PLATFORM: linux/amd64
@@ -42,25 +44,6 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # DECISION (2026-06-21): Cosign signing is DEFERRED. This gate is OFF by
-    # default. Our partner CEL pins the image DIGEST. It does not pin a
-    # signature. Thus a signature gates nothing. teecryptor is our digest-pin
-    # twin. It made the same decision. The build and the push work without a
-    # signature.
-    #
-    # To enable signing later, set the SHARED Fhenix Cosign key as two secrets:
-    # COSIGN_PRIVATE_KEY and COSIGN_PASSWORD. Use the same org key as teecryptor
-    # and zk. Do NOT make a new key for this repo. The signing steps below then
-    # run. See DESIGN.md paragraph 13.
-    env:
-      HAS_COSIGN: ${{ secrets.COSIGN_PRIVATE_KEY != '' }}
-      # SLSA build provenance is a STUB. It is OFF by default. It makes a
-      # signed attestation of the builder identity and the source. This becomes
-      # useful when the repo goes public. An external consumer can then verify
-      # the origin of the image. To turn it on, set the repo variable
-      # ENABLE_SLSA to "true". See DESIGN.md paragraph 13.
-      ENABLE_SLSA: ${{ vars.ENABLE_SLSA }}
-
     steps:
       # The image digest goes into the partner attestation CEL. The same image
       # runs the key ceremony. Thus this job must not build a commit that has a
@@ -151,6 +134,8 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
+      # The build makes one platform. Thus this digest is the amd64 platform
+      # digest. The signature, the attestation and the partner pin all name it.
       - name: Build and push image
         id: push
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
@@ -163,31 +148,23 @@ jobs:
           provenance: false
 
       - name: Install Cosign
-        if: env.HAS_COSIGN == 'true'
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
 
-      - name: Sign image with Cosign (private — no transparency log)
-        if: env.HAS_COSIGN == 'true'
+      # Cosign gets a certificate from Fulcio with this job's OIDC token. The
+      # certificate names the repo, the workflow, the ref and the commit. The
+      # partner asserts those four fields at pin time.
+      - name: Sign the image with keyless Cosign
         env:
-          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
-          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
           REGISTRY: ${{ vars.KEYGEN_IMAGE_REGISTRY }}
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           set -euo pipefail
-          # --tlog-upload=false keeps the signature out of the public Sigstore
-          # log, which is Rekor. This repo is private. Cosign attaches the
-          # signature to the image in our registry. The public key verifies it.
-          cosign sign --yes --tlog-upload=false \
-            --key env://COSIGN_PRIVATE_KEY \
-            "${REGISTRY}@${DIGEST}"
+          cosign sign --yes "${REGISTRY}@${DIGEST}"
 
-      # SLSA build provenance. This is a STUB. It is OFF while ENABLE_SLSA is
-      # not "true". When the repo goes public, set the repo variable ENABLE_SLSA
-      # to "true". This step then emits a signed provenance attestation for the
-      # pushed image digest.
+      # The same identity attests the same digest in the standard SLSA format.
+      # The partner verify command reads the Cosign signature above. This
+      # attestation serves any other consumer.
       - name: Attest SLSA build provenance
-        if: env.ENABLE_SLSA == 'true'
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
           subject-name: ${{ vars.KEYGEN_IMAGE_REGISTRY }}
@@ -199,20 +176,41 @@ jobs:
           REGISTRY: ${{ vars.KEYGEN_IMAGE_REGISTRY }}
           TAG: ${{ inputs.tag }}
           DIGEST: ${{ steps.push.outputs.digest }}
-          SIGNED: ${{ env.HAS_COSIGN }}
+          COMMIT: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          # workflow_ref is "<owner>/<repo>/<path>@<ref>". Add the server URL and
+          # it equals the Fulcio certificate identity.
+          IDENTITY: ${{ github.server_url }}/${{ github.workflow_ref }}
         run: |
           set -euo pipefail
           {
             echo "## keygen image built"
             echo
-            echo "**Tag:** \`${TAG}\`  ·  **Signed:** \`${SIGNED}\`"
+            echo "**Tag:** \`${TAG}\`"
             echo
-            echo "**Digest:**"
-            echo '```'
-            echo "${DIGEST}"
-            echo '```'
-            echo "**Pin it on the partner side** (key-share-holders values.tfvars):"
+            echo "### Hand these two values to each partner"
+            echo
             echo '```hcl'
             echo "image_digest = \"${DIGEST}\""
+            echo "source_sha   = \"${COMMIT}\""
+            echo '```'
+            echo
+            echo "That is the whole handoff. The partner tooling holds the rest"
+            echo "as fixed constants."
+            echo
+            echo "### Verify this image against the public Rekor log"
+            echo
+            echo "The partner runs this on their own machine. It proves that this"
+            echo "workflow built this digest from this commit. A non-zero exit means:"
+            echo "do not pin."
+            echo
+            echo '```'
+            echo "cosign verify ${REGISTRY}@${DIGEST} \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  --certificate-identity ${IDENTITY} \\"
+            echo "  --certificate-github-workflow-repository ${REPO} \\"
+            echo "  --certificate-github-workflow-ref ${REF} \\"
+            echo "  --certificate-github-workflow-sha ${COMMIT}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
