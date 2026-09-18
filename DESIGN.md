@@ -378,6 +378,11 @@ now passes the partner's digest-pinned attested-reader gate.
   Cosign. It also attests SLSA build provenance. Both use the workflow's OIDC token and
   get a short-lived certificate from Fulcio. Both go to the public Rekor log. No signing
   key exists. The certificate names the repository, the workflow, the ref and the commit.
+- **The image registry is public, on purpose.** The Artifact Registry repository grants
+  `allUsers` the reader role. The source is public, so the image holds no secret, and open
+  images support the trust story. Cosign stores the signature beside the image, so a
+  partner reads it with no credential and no account. **The partner check depends on that
+  grant.** Do not remove it without a replacement path for the signature.
 - **The partner verifies before it pins.** A signature gates nothing at run time under a
   digest pin. It gates the *pin*. The partner runs `cosign verify` on its own machine,
   against public Rekor. The command asserts the exact digest and the exact commit. A

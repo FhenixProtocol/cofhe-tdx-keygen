@@ -153,6 +153,10 @@ jobs:
       # Cosign gets a certificate from Fulcio with this job's OIDC token. The
       # certificate names the repo, the workflow, the ref and the commit. The
       # partner asserts those four fields at pin time.
+      # Cosign stores the signature next to the image, under the tag
+      # sha256-<digest>.sig. This registry grants allUsers the reader role, so a
+      # partner reads that signature with no credential. That public read is
+      # DELIBERATE and the partner check depends on it. Do not remove it.
       - name: Sign the image with keyless Cosign
         env:
           REGISTRY: ${{ vars.KEYGEN_IMAGE_REGISTRY }}
@@ -164,6 +168,9 @@ jobs:
       # The same identity attests the same digest in the standard SLSA format.
       # The partner verify command reads the Cosign signature above. This
       # attestation serves any other consumer.
+      #
+      # push-to-registry also puts the bundle beside the image. GitHub serves it
+      # on a public API too, so this is a second public path, not the only one.
       - name: Attest SLSA build provenance
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
