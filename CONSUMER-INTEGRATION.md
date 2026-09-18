@@ -98,11 +98,10 @@ of environment names it defines, is the single source of truth in
 `crates/cofhe-keys/src/envs.rs`. Adding an env is a code change plus a consumer rebuild,
 by design.
 
-> **The `mainnet` entry holds the real partner set: six independent operators,
-> threshold 3.** Three slots are still open, pending their project numbers. While any
-> slot is open, `partner_refs` fails closed, so a consumer cannot build its partner
-> list and cannot read. Filling a slot is an `envs.rs` edit → consumer rebuild → new
-> digests re-pinned in the `keygen-partners` var-file → all six partners re-apply
+> **The `mainnet` entry holds the real partner set: six key-share holders, threshold
+> 3.** Every slot holds a real project id and number, so a consumer builds its partner
+> list and reads normally. Changing a holder is an `envs.rs` edit → consumer rebuild →
+> new digests re-pinned in the `keygen-partners` var-file → all six partners re-apply
 > `partner/`. There is no path that skips the rebuild.
 >
 > Do not gate on the partner count you see at build time. Call `partner_refs` and

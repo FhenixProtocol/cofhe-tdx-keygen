@@ -464,26 +464,24 @@ mod tests {
     }
 
     #[test]
-    // The mainnet set is baked at its real shape (N=6, T=3) with three slots still to
-    // fill, so a ceremony must refuse to start. Check the baked shape directly, then
-    // the refusal.
-    fn mainnet_refuses_a_ceremony_while_partner_slots_are_open() {
-        let ec = cofhe_keys::envs::lookup("mainnet").unwrap();
-        assert_eq!(ec.partners.len(), 6);
-        assert_eq!(ec.shamir_threshold, 3);
-        assert_eq!(ec.partners[0].project_id, "fhenix-507307");
-        assert!(ec.partners[0]
-            .keygen_write_audience
-            .ends_with("/providers/cofhe-tee-keygen-provider"));
-        assert_eq!(ec.public_bucket, "fhenix-mainnet-keys");
-
-        // `Config` is not `Debug` (it carries the write audiences), so match rather
-        // than `expect_err`.
-        let err = match Config::for_env("mainnet") {
-            Ok(_) => panic!("an incomplete partner set must not build a ceremony config"),
-            Err(e) => e.to_string(),
-        };
-        assert!(err.contains("cannot run a ceremony"), "{err}");
+    // The mainnet partner set is complete, so it builds a real 3-of-6 ceremony whose
+    // write audiences point at the keygen pool+provider, not the reader pool.
+    fn builds_mainnet_from_baked_env() {
+        let cfg = Config::for_env("mainnet").expect("the mainnet partner set is complete");
+        assert_eq!(cfg.partners.len(), 6);
+        assert_eq!(cfg.shares, 6);
+        assert_eq!(cfg.threshold, 3);
+        assert_eq!(cfg.partners[0].project_id, "fhenix-507307");
+        assert_eq!(cfg.public_bucket, "fhenix-mainnet-keys");
+        for p in &cfg.partners {
+            assert!(
+                p.wip_audience
+                    .ends_with("/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider"),
+                "partner {} must write through the keygen pool, got {}",
+                p.project_id,
+                p.wip_audience
+            );
+        }
     }
 
     // Fail-closed: an env outside the baked map is rejected before any network call.
