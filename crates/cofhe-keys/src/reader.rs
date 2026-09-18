@@ -436,7 +436,24 @@ mod tests {
     // list and the reconstruct would succeed at a silently reduced N.
     #[test]
     fn partner_refs_refuses_an_incomplete_partner_set() {
-        let env = lookup("mainnet").unwrap();
+        // A fixture, not a baked env: every baked env is complete now.
+        let partners: &'static [crate::envs::EnvPartner] = Box::leak(
+            vec![crate::envs::EnvPartner {
+                project_id: "FILL-ME-PARTNER-9",
+                wip_pool_audience: "//iam.googleapis.com/projects/999999999999/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
+                keygen_write_audience: "//iam.googleapis.com/projects/999999999999/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
+            }]
+            .into_boxed_slice(),
+        );
+        let fixture = EnvConfig {
+            partners,
+            public_bucket: "b",
+            public_object: "p/0/public-material",
+            public_prefix: "p",
+            public_zone: 0,
+            shamir_threshold: 2,
+        };
+        let env = &fixture;
         // `PartnerRef` is deliberately not `Debug`, so match rather than `expect_err`.
         let err = match partner_refs(env, "teecryptor", "cofhe-tee-fhe-priv") {
             Ok(_) => panic!("an open partner slot must fail closed"),

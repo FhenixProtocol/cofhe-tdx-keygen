@@ -113,11 +113,10 @@ const TESTNET: EnvConfig = EnvConfig {
 /// stack in its own GCP project, and reconstructing a secret needs 3 of the 6, so no
 /// single operator holds a usable secret.
 ///
-/// INCOMPLETE: partner 6 is a `FILL-ME-` placeholder, pending the last project
-/// number. While it remains, [`EnvConfig::ensure_partners_complete`] fails,
-/// which blocks both the ceremony ([`crate::envs`] consumers call it at config build)
-/// and the read side ([`crate::reader::partner_refs`]). Filling the remaining slot needs
-/// no other edit: N, T and the tests are already at their final shape.
+/// The set is complete: every slot holds a real project id and project number, so
+/// [`EnvConfig::ensure_partners_complete`] passes. The gate stays in place for a slot
+/// vacated later — it blocks the ceremony ([`crate::envs`] consumers call it at config
+/// build) and the read side ([`crate::reader::partner_refs`]).
 ///
 /// Every slot is one operator, one project, and all six are treated identically here.
 /// A project name is chosen by its operator and identifies no one — do not read
@@ -156,9 +155,9 @@ const MAINNET: EnvConfig = EnvConfig {
             keygen_write_audience: "//iam.googleapis.com/projects/581791888267/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
         },
         EnvPartner {
-            project_id: "FILL-ME-PARTNER-6",
-            wip_pool_audience: "//iam.googleapis.com/projects/FILL-ME-PROJECT-NUMBER-6/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
-            keygen_write_audience: "//iam.googleapis.com/projects/FILL-ME-PROJECT-NUMBER-6/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
+            project_id: "fhenix-508914",
+            wip_pool_audience: "//iam.googleapis.com/projects/902597681407/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
+            keygen_write_audience: "//iam.googleapis.com/projects/902597681407/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
         },
     ],
     // This is the single source of truth for the mainnet public location;
