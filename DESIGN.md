@@ -345,7 +345,7 @@ now passes the partner's digest-pinned attested-reader gate.
 | Stamp provenance, do not consume it | The token stays in the wire format for compatibility; the write-gate and bucket IAM carry integrity (§7) |
 | Fresh keys, all-or-nothing | No persistence/resume; any partner failure crashes the run |
 | Digest-pin the partner CEL (production) | Partner explicitly approves each exact image via TF apply; only that digest can write. Re-apply per image rotation is intended (explicit per-image consent), not a cost. Chosen over Cosign-fingerprint pinning, which is looser ("anything our key signs"). |
-| Defer Cosign signing | Digest-pin gates on the image, not a signature, so signing gates nothing — teecryptor (our twin) made the same call. CI keyless build/push is done; signing is a gated, off-by-default step, enabled later with the shared organisation key. See §13. |
+| Keyless Cosign + SLSA, checked at pin time | A signature gates nothing at *runtime* under a digest pin, so it gates the *pin* instead. The build signs the digest keylessly (OIDC → Fulcio → public Rekor); the partner asserts digest + commit + repo + workflow before approving the digest. Keyless, so there is no Fhenix key to trust or rotate. See §13. |
 | TLS 1.3 + X25519MLKEM768 only, fail-closed | Key shares must resist harvest-now-decrypt-later; only the ML-KEM hybrid addresses it. aws-lc-rs provider (rustls's default; ring has no ML-KEM, graviola too young for key material; leaving rustls would put a C TLS stack in the distroless image). Enforcement lives in the clients (`cofhe_keys::tls`), so consumers inherit it on rev bump with no config. Cost: aws-lc-sys needs cmake at build time. |
 
 ## 12. Operational model
@@ -374,11 +374,23 @@ now passes the partner's digest-pinned attested-reader gate.
   needs a partner re-apply. We chose that for explicit per-image consent. The alternative
   was Cosign-fingerprint pinning, which lets us rotate freely but weakens the gate to
   "anything our key signs".
-- **The image is not signed today.** The build workflow carries a Cosign step that stays
-  inert, because it runs only when a signing key is configured and none is. Signing gates
-  nothing under a digest pin, which is why it is off rather than pending. If we enable it
-  later, it loads the shared organisation signing key rather than a new per-repo key, and
-  it adds supply-chain provenance without changing the partner gate.
+- **The image is signed, keylessly.** The build workflow signs the pushed digest with
+  Cosign. It also attests SLSA build provenance. Both use the workflow's OIDC token and
+  get a short-lived certificate from Fulcio. Both go to the public Rekor log. No signing
+  key exists. The certificate names the repository, the workflow, the ref and the commit.
+- **The image registry is public, on purpose.** The Artifact Registry repository grants
+  `allUsers` the reader role. The source is public, so the image holds no secret, and open
+  images support the trust story. Cosign stores the signature beside the image, so a
+  partner reads it with no credential and no account. **The partner check depends on that
+  grant.** Do not remove it without a replacement path for the signature.
+- **The partner verifies before it pins.** A signature gates nothing at run time under a
+  digest pin. It gates the *pin*. The partner runs `cosign verify` on its own machine,
+  against public Rekor. The command asserts the exact digest and the exact commit. A
+  non-zero exit means the partner does not pin. This is where the commit↔digest↔repo proof
+  holds, because the CEL cannot carry it. The tooling lives in `key-share-holders`.
+- **The handoff per release is two values:** `{image_digest, source_sha}`. The registry,
+  the OIDC issuer, the workflow identity and the ref are public constants. The partner
+  bakes them once per image.
 - **Consumer wiring is live.** Both consumers embed the reader and read
   partner-enforced attested shares; see
   [`CONSUMER-INTEGRATION.md`](CONSUMER-INTEGRATION.md).
