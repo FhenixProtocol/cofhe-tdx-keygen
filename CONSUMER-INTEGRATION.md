@@ -83,7 +83,9 @@ is in the `partner-onboarding` module in
 `secretAccessor` is granted directly to the digest-scoped attested principal
 (`principalSet://…/attribute.image_digest/<digest>`) on **only** that consumer's
 secret. There is no unpinned fallback, so **rotating a consumer image requires a
-partner re-apply with the new digest**. That is explicit per-image consent, the same as
+partner re-apply with the new digest and its `source_sha`**. Both come from the build
+run's summary, and the partner's apply fails without the commit — every attested reader
+must name the commit its image was built from. That is explicit per-image consent, the same as
 the keygen write pin. The module pins **one** digest per consumer, so the moment a
 partner re-applies, the old image loses read access there. A running instance keeps
 serving from memory, but it could no longer boot, so keep the gap between the re-pin and

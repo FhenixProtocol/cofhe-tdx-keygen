@@ -97,16 +97,25 @@ laptop is slow and prone to OOM, so the runner builds natively.
 
 For pre-merge iteration, build the same Dockerfile with Cloud Build or `docker buildx`
 under your own credentials. Both paths push to the same registry, and a production gate
-pins one exact digest, so a dev image is never accepted.
+pins one exact digest, so a dev image is never accepted. An image built outside the
+workflow carries **no provenance**, so a partner's check on it fails — correctly, but the
+message reads like tampering.
 
-**Record the `(source commit, image digest)` pair.** The commit is an audit reference:
-it says which source produced the digest, so a reviewer can read that code. The digest
-is what the gate enforces.
+**The partner check does not tell a dev image from a release.** A dispatch from `main`
+with a tag like `dev-alice` produces a genuine attestation, and the check passes. It
+proves only "our workflow, on main, built this digest from this commit". Choosing which
+commit is a release stays a human decision. Never hand a partner a digest you did not
+mean to release.
+
+**Record the `(source commit, image digest)` pair.** Both come from the run summary.
+The commit is not just an audit reference: the partner proves the pair against the
+public log before it pins anything, so a wrong or missing commit blocks the release.
+The digest is what the runtime gate enforces.
 
 ### Step 3 — Each partner pins the blessed digest
 
 For any non-development run, each partner re-applies their onboarding module with the
-released image digest pinned (the module's `image_digest` variable; see
+released image digest **and** the source commit (`image_digest` and `source_sha`; see
 [`key-share-holders`](https://github.com/FhenixProtocol/key-share-holders)). Their CEL
 then accepts only that exact image, and the write grant is scoped to the same digest.
 
@@ -197,21 +206,27 @@ leave them applied. Secret versions are retained.
 
 The shipped defaults suit development. A real deployment adds all four.
 
-1. **Pin `image_digest` in every partner CEL.** The module ships it empty, which is a
-   development default, and an unpinned CEL accepts any attested Confidential Space
-   workload in our compute project.
+1. **Pin `image_digest` in every partner CEL, and give `source_sha` beside it.** The
+   module ships the digest empty, which is a development default, and an unpinned CEL
+   accepts any attested Confidential Space workload in our compute project. A pinned
+   digest without its commit fails the partner's apply: the provenance check cannot run
+   without both.
 2. **Deploy by digest, never by a mutable tag.** The service stack's image reference uses
    the `@sha256:` form and matches the pinned digest. A tag can move, and a VM whose
    image does not match the pin is correctly rejected at the write.
 3. **Build through the release workflow** on `main`, and pin that CI-built digest in both
    places above.
-4. **Re-pin every partner to the blessed image** before the run.
+4. **Re-pin every partner to the blessed image** before the run, with both values from
+   that run's summary. Cutting the release that carries them is one dispatch; see
+   [`RELEASING.md`](https://github.com/FhenixProtocol/key-share-holders/blob/main/RELEASING.md)
+   in `key-share-holders`.
 
 ## 4. Development versus production
 
 - **Digest pinning.** Development leaves `image_digest` empty, so a rebuild forces no
   re-apply. Production pins it in every partner CEL, and the digest pin is the
-  enforcement that decides which image can write.
+  enforcement that decides which image can write. Production also carries `source_sha`,
+  which the partner proves before it pins; it never enters the CEL.
 - **Write access.** `grant_write_access` stays `false` outside a ceremony apply, and the
   partner is the one who turns it on.
 - **Who runs the partner stack.** In production the partner runs it in their own project.

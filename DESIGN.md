@@ -345,7 +345,7 @@ now passes the partner's digest-pinned attested-reader gate.
 | Stamp provenance, do not consume it | The token stays in the wire format for compatibility; the write-gate and bucket IAM carry integrity (§7) |
 | Fresh keys, all-or-nothing | No persistence/resume; any partner failure crashes the run |
 | Digest-pin the partner CEL (production) | Partner explicitly approves each exact image via TF apply; only that digest can write. Re-apply per image rotation is intended (explicit per-image consent), not a cost. Chosen over Cosign-fingerprint pinning, which is looser ("anything our key signs"). |
-| Defer Cosign signing | Digest-pin gates on the image, not a signature, so signing gates nothing — teecryptor (our twin) made the same call. CI keyless build/push is done; signing is a gated, off-by-default step, enabled later with the shared organisation key. See §13. |
+| Keyless SLSA provenance, checked at pin time | Provenance gates nothing at *runtime* under a digest pin, so it gates the *pin* instead. Each build attests the digest keylessly (OIDC → Fulcio → public Rekor, plus GitHub's public attestation API); the partner asserts digest + commit + repo + workflow + `refs/heads/main` before approving the digest. Keyless, so there is no Fhenix key to trust or rotate. See §13. |
 | TLS 1.3 + X25519MLKEM768 only, fail-closed | Key shares must resist harvest-now-decrypt-later; only the ML-KEM hybrid addresses it. aws-lc-rs provider (rustls's default; ring has no ML-KEM, graviola too young for key material; leaving rustls would put a C TLS stack in the distroless image). Enforcement lives in the clients (`cofhe_keys::tls`), so consumers inherit it on rev bump with no config. Cost: aws-lc-sys needs cmake at build time. |
 
 ## 12. Operational model
@@ -374,11 +374,26 @@ now passes the partner's digest-pinned attested-reader gate.
   needs a partner re-apply. We chose that for explicit per-image consent. The alternative
   was Cosign-fingerprint pinning, which lets us rotate freely but weakens the gate to
   "anything our key signs".
-- **The image is not signed today.** The build workflow carries a Cosign step that stays
-  inert, because it runs only when a signing key is configured and none is. Signing gates
-  nothing under a digest pin, which is why it is off rather than pending. If we enable it
-  later, it loads the shared organisation signing key rather than a new per-repo key, and
-  it adds supply-chain provenance without changing the partner gate.
+- **The build attests provenance, keylessly.** The workflow emits a SLSA build
+  provenance attestation for the pushed digest. It uses the workflow's OIDC token and
+  gets a short-lived certificate from Fulcio. No signing key exists. The certificate
+  names the repository, the workflow, the ref and the commit. The attestation goes to
+  the public Rekor log, and GitHub serves it on a public API that needs no account.
+- **The image registry is public, on purpose.** The Artifact Registry repository grants
+  `allUsers` the reader role. The source is public, so the image holds no secret, and open
+  images support the trust story. The partner check resolves the image manifest through
+  that grant, so **the check depends on it.** The attestation itself lives on GitHub's
+  public API, not in the registry.
+- **The partner verifies before it pins.** Provenance gates nothing at run time under a
+  digest pin. It gates the *pin*. The partner runs `gh attestation verify` on its own
+  machine, against the attestation bundle it fetches from a public API. The command
+  asserts the exact digest, the exact commit, this repository, this workflow file and
+  `refs/heads/main`. A non-zero exit means the partner does not pin. This is where the
+  commit↔digest↔repo proof holds, because the CEL cannot carry it. The tooling lives in
+  `key-share-holders`.
+- **The handoff per release is two values:** `{image_digest, source_sha}`. The registry,
+  the OIDC issuer, the workflow identity and the ref are public constants. The partner
+  bakes them once per image.
 - **Consumer wiring is live.** Both consumers embed the reader and read
   partner-enforced attested shares; see
   [`CONSUMER-INTEGRATION.md`](CONSUMER-INTEGRATION.md).
