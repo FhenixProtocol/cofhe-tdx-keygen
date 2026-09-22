@@ -374,20 +374,23 @@ now passes the partner's digest-pinned attested-reader gate.
   needs a partner re-apply. We chose that for explicit per-image consent. The alternative
   was Cosign-fingerprint pinning, which lets us rotate freely but weakens the gate to
   "anything our key signs".
-- **The image is signed, keylessly.** The build workflow signs the pushed digest with
-  Cosign. It also attests SLSA build provenance. Both use the workflow's OIDC token and
-  get a short-lived certificate from Fulcio. Both go to the public Rekor log. No signing
-  key exists. The certificate names the repository, the workflow, the ref and the commit.
+- **The build attests provenance, keylessly.** The workflow emits a SLSA build
+  provenance attestation for the pushed digest. It uses the workflow's OIDC token and
+  gets a short-lived certificate from Fulcio. No signing key exists. The certificate
+  names the repository, the workflow, the ref and the commit. The attestation goes to
+  the public Rekor log, and GitHub serves it on a public API that needs no account.
 - **The image registry is public, on purpose.** The Artifact Registry repository grants
   `allUsers` the reader role. The source is public, so the image holds no secret, and open
-  images support the trust story. Cosign stores the signature beside the image, so a
-  partner reads it with no credential and no account. **The partner check depends on that
-  grant.** Do not remove it without a replacement path for the signature.
-- **The partner verifies before it pins.** A signature gates nothing at run time under a
-  digest pin. It gates the *pin*. The partner runs `cosign verify` on its own machine,
-  against public Rekor. The command asserts the exact digest and the exact commit. A
-  non-zero exit means the partner does not pin. This is where the commit↔digest↔repo proof
-  holds, because the CEL cannot carry it. The tooling lives in `key-share-holders`.
+  images support the trust story. The partner check resolves the image manifest through
+  that grant, so **the check depends on it.** The attestation itself lives on GitHub's
+  public API, not in the registry.
+- **The partner verifies before it pins.** Provenance gates nothing at run time under a
+  digest pin. It gates the *pin*. The partner runs `gh attestation verify` on its own
+  machine, against the attestation bundle it fetches from a public API. The command
+  asserts the exact digest, the exact commit, this repository, this workflow file and
+  `refs/heads/main`. A non-zero exit means the partner does not pin. This is where the
+  commit↔digest↔repo proof holds, because the CEL cannot carry it. The tooling lives in
+  `key-share-holders`.
 - **The handoff per release is two values:** `{image_digest, source_sha}`. The registry,
   the OIDC issuer, the workflow identity and the ref are public constants. The partner
   bakes them once per image.

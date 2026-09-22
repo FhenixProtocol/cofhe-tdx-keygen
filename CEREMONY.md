@@ -97,16 +97,19 @@ laptop is slow and prone to OOM, so the runner builds natively.
 
 For pre-merge iteration, build the same Dockerfile with Cloud Build or `docker buildx`
 under your own credentials. Both paths push to the same registry, and a production gate
-pins one exact digest, so a dev image is never accepted.
+pins one exact digest, so a dev image is never accepted. A dev image carries **no
+provenance**, so a partner's check on it fails — correctly, but the message reads like
+tampering. Never hand a partner a dev digest.
 
-**Record the `(source commit, image digest)` pair.** The commit is an audit reference:
-it says which source produced the digest, so a reviewer can read that code. The digest
-is what the gate enforces.
+**Record the `(source commit, image digest)` pair.** Both come from the run summary.
+The commit is not just an audit reference: the partner proves the pair against the
+public log before it pins anything, so a wrong or missing commit blocks the release.
+The digest is what the runtime gate enforces.
 
 ### Step 3 — Each partner pins the blessed digest
 
 For any non-development run, each partner re-applies their onboarding module with the
-released image digest pinned (the module's `image_digest` variable; see
+released image digest **and** the source commit (`image_digest` and `source_sha`; see
 [`key-share-holders`](https://github.com/FhenixProtocol/key-share-holders)). Their CEL
 then accepts only that exact image, and the write grant is scoped to the same digest.
 
