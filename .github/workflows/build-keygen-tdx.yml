@@ -1,5 +1,5 @@
-name: Build & sign keygen TDX image
-run-name: Build & sign keygen TDX image — ${{ inputs.tag }}
+name: Build keygen TDX image
+run-name: Build keygen TDX image — ${{ inputs.tag }}
 
 # This workflow builds the keygen image. It pushes the image to the shared
 # fhenix-artifacts-registry project, repo cofhe-tee-keygen. It uses GitHub
@@ -136,7 +136,7 @@ jobs:
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       # The build makes one platform. Thus this digest is the amd64 platform
-      # digest. The signature, the attestation and the partner pin all name it.
+      # digest. The attestation and the partner pin both name it.
       - name: Build and push image
         id: push
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
@@ -151,15 +151,15 @@ jobs:
       # The certificate Fulcio issues names this repo, this workflow, the ref and
       # the commit. Those are the four fields the partner asserts at pin time.
       #
-      # This action is pinned by SHA. A moved tag on it forges provenance for
-      # every image we ship. Other actions in this file are not pinned; that is a
-      # wider gap, not something this pin closes.
+      # Pinned by SHA, as is every other action in this file. A moved tag here
+      # would forge provenance for every image we ship.
       #
       # push-to-registry stays FALSE. GitHub serves the bundle on a public API
       # that needs no account, which is where the partner reads it. Pushing it to
       # the registry as well needs registry credentials in a form this action
       # cannot read, and buys nothing.
       - name: Attest SLSA build provenance
+        id: attest
         if: github.ref == 'refs/heads/main'
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
@@ -182,6 +182,8 @@ jobs:
           REPO: FhenixProtocol/cofhe-tdx-keygen
           SIGNER_WORKFLOW: FhenixProtocol/cofhe-tdx-keygen/.github/workflows/build-keygen-tdx.yml
           REF: refs/heads/main
+          # The handoff is only safe to use when provenance actually exists.
+          ATTESTED: ${{ steps.attest.outcome == 'success' }}
         run: |
           set -euo pipefail
           {
@@ -189,30 +191,50 @@ jobs:
             echo
             echo "**Tag:** \`${TAG}\`"
             echo
-            echo "### Hand these two values to each partner"
+            if [ "${ATTESTED}" != "true" ]; then
+              echo "> ### NO ATTESTATION — DO NOT HAND THIS TO A PARTNER"
+              echo ">"
+              echo "> The attestation step did not succeed, so no provenance exists"
+              echo "> for this digest. A partner check on it fails, and the failure"
+              echo "> reads like tampering. Re-run the build."
+              echo
+              echo "**Digest (for recovery only):**"
+              echo
+              echo '```'
+              echo "${DIGEST}"
+              echo '```'
+            else
+              echo "### Hand these two values to each partner"
+              echo
+              echo '```hcl'
+              echo "image_digest = \"${DIGEST}\""
+              echo "source_sha   = \"${COMMIT}\""
+              echo '```'
+              echo
+              echo "That is the whole handoff. The partner tooling holds the rest"
+              echo "as fixed constants."
             echo
-            echo '```hcl'
-            echo "image_digest = \"${DIGEST}\""
-            echo "source_sha   = \"${COMMIT}\""
-            echo '```'
-            echo
-            echo "That is the whole handoff. The partner tooling holds the rest"
-            echo "as fixed constants."
-            echo
-            echo "### Verify this image"
-            echo
-            echo "Runs on any machine. It needs no Fhenix credential and no GitHub"
-            echo "account. A non-zero exit means: do not pin."
-            echo
-            echo '```bash'
-            echo "curl -sL https://api.github.com/repos/${REPO}/attestations/${DIGEST} \\"
-            echo "  | jq '.attestations[0].bundle' > bundle.json"
-            echo
-            echo "gh attestation verify oci://${REGISTRY}@${DIGEST} \\"
-            echo "  --bundle bundle.json \\"
-            echo "  --repo ${REPO} \\"
-            echo "  --signer-workflow ${SIGNER_WORKFLOW} \\"
-            echo "  --source-ref ${REF} \\"
-            echo "  --source-digest ${COMMIT}"
-            echo '```'
+              echo
+              echo "### Verify this image"
+              echo
+              echo "The partner tool in key-share-holders (\`partner/verify-image.sh\`)"
+              echo "is the authoritative check and holds these values as constants."
+              echo "This is the same check, spelled out, for anyone without that repo."
+              echo "It runs on any machine and needs no Fhenix credential and no"
+              echo "GitHub account. A non-zero exit means: do not pin."
+              echo
+              echo '```bash'
+              echo "# -f so a missing attestation fails here, loudly, rather than"
+              echo "# writing \"null\" into bundle.json and confusing gh."
+              echo "curl -fsSL https://api.github.com/repos/${REPO}/attestations/${DIGEST} \\"
+              echo "  | jq '.attestations[0].bundle' > bundle.json"
+              echo
+              echo "gh attestation verify oci://${REGISTRY}@${DIGEST} \\"
+              echo "  --bundle bundle.json \\"
+              echo "  --repo ${REPO} \\"
+              echo "  --signer-workflow ${SIGNER_WORKFLOW} \\"
+              echo "  --source-ref ${REF} \\"
+              echo "  --source-digest ${COMMIT}"
+              echo '```'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
