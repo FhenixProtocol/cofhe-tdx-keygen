@@ -217,7 +217,9 @@ The shipped defaults suit development. A real deployment adds all four.
 3. **Build through the release workflow** on `main`, and pin that CI-built digest in both
    places above.
 4. **Re-pin every partner to the blessed image** before the run, with both values from
-   that run's summary.
+   that run's summary. Cutting the release that carries them is one dispatch; see
+   [`RELEASING.md`](https://github.com/FhenixProtocol/key-share-holders/blob/main/RELEASING.md)
+   in `key-share-holders`.
 
 ## 4. Development versus production
 
