@@ -40,6 +40,12 @@ variable "run_ceremony" {
   description = "When true, create the one-shot TDX keygen VM and run a ceremony. Keep false for routine infra applies."
 }
 
+variable "public_material_anonymous_read" {
+  type        = bool
+  default     = false
+  description = "When true, grant allUsers objectViewer on a managed folder over the public-material prefix, so anyone can read the published keys and nothing else in the bucket. The bucket must not have public access prevention enforced."
+}
+
 variable "public_material_readers" {
   type        = list(string)
   default     = []

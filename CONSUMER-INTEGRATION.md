@@ -138,7 +138,11 @@ federated one, because it sits in our bucket rather than a partner's. Per env:
 |---|---|---|
 | staging | `localcofhenix` | world-readable (`allUsers` → `objectViewer`); no per-SA grant |
 | testnet | `fhenix-testnet-v2` | IAM-gated; `public_material_reader` grant to each consumer's compute SA, **prefix-conditioned** to `${public_prefix}/` so read stays scoped to the published material |
-| mainnet | `fhenix-mainnet-keys` | world-readable (`allUsers` → `objectViewer`); no per-SA grant, so `public_material_readers` stays empty. A dedicated bucket that holds nothing but the published public material, so no prefix-conditioned grant is needed. |
+| mainnet | `fhenix-mainnet-keys` | world-readable under `${public_prefix}/` only: `public_material_anonymous_read = true` grants `allUsers` → `objectViewer` on a managed folder over the prefix. No per-SA grant, so `public_material_readers` stays empty. |
+
+IAM Conditions do not accept `allUsers`, so an anonymous grant gets its prefix scope
+from a managed folder (`public_material_anonymous_read`), never a bucket-wide binding.
+Any env can turn it on, once public access prevention is off on its bucket.
 
 Its integrity rests on the bucket's **write** IAM: only the keygen producer may write
 these objects. It does not rest on a consumer-verified attestation, which was removed
