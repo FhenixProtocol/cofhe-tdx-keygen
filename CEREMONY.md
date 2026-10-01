@@ -95,11 +95,19 @@ workflow's `job_workflow_ref`, so a branch dispatch fails federation by design.
 Confidential Space is amd64, and a release build of tfhe under emulation on an arm64
 laptop is slow and prone to OOM, so the runner builds natively.
 
+**The workflow runs the pushed image before it attests it.**
+`scripts/check-image-boots.sh` starts the exact digest with no network and no
+`COFHE_ENV`, and requires the keygen's own "COFHE_ENV not set" error. Provenance
+proves who built an image, not that it starts: an image whose binary cannot load
+passes every provenance check and fails only at ceremony time. If this step fails,
+the workflow does not attest the digest, so no partner can pin it. CI runs the same
+check on every commit, and the workflow refuses a commit without green CI.
+
 For pre-merge iteration, build the same Dockerfile with Cloud Build or `docker buildx`
-under your own credentials. Both paths push to the same registry, and a production gate
-pins one exact digest, so a dev image is never accepted. An image built outside the
-workflow carries **no provenance**, so a partner's check on it fails — correctly, but the
-message reads like tampering.
+under your own credentials, and run `scripts/check-image-boots.sh` on it. Both paths
+push to the same registry, and a production gate pins one exact digest, so a dev image
+is never accepted. An image built outside the workflow carries **no provenance**, so a
+partner's check on it fails — correctly, but the message reads like tampering.
 
 **The partner check does not tell a dev image from a release.** A dispatch from `main`
 with a tag like `dev-alice` produces a genuine attestation, and the check passes. It

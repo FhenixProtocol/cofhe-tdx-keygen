@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Prove that a built keygen image starts: the binary loads, links and runs main.
+#
+#   scripts/check-image-boots.sh <image-ref>
+#
+# A provenance check proves who built an image. It does not prove that the image
+# runs. An image whose binary cannot load passes every provenance check, and the
+# failure shows only at ceremony time.
+#
+# The check runs the image with no COFHE_ENV and no network. The keygen first
+# installs the rustls crypto provider (aws-lc), then reads COFHE_ENV and stops.
+# The expected error thus proves that the dynamic loader, glibc and the TLS
+# provider all work, and that nothing else ran: no key generation and no I/O.
+set -euo pipefail
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: $0 <image-ref>" >&2
+  exit 2
+fi
+image="$1"
+# The context string of Config::from_env in crates/keygen/src/main.rs. A change
+# to that message must change this line too.
+expected='env var COFHE_ENV not set'
+
+# The keygen must exit non-zero here. Capture the exit code without set -e
+# aborting the script.
+set +e
+output="$(docker run --rm --network none --platform linux/amd64 "${image}" 2>&1)"
+status=$?
+set -e
+
+printf '%s\n' "${output}"
+
+if [ "${status}" -eq 0 ]; then
+  echo "::error::${image} exited 0 with no COFHE_ENV. It must refuse to start." >&2
+  exit 1
+fi
+if ! grep -qF "${expected}" <<<"${output}"; then
+  echo "::error::${image} did not reach main. Expected the error: ${expected}" >&2
+  exit 1
+fi
+echo "OK: ${image} loads and runs main."
