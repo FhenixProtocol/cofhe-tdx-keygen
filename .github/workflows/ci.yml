@@ -55,6 +55,35 @@ jobs:
       - name: reader.rs ↔ terraform public-material drift
         run: ./scripts/check-tf-reader-drift.sh
 
+  # Build the enclave image from the Dockerfile and run it. The cargo jobs above
+  # build on the runner, not in the image, so they cannot see a fault between the
+  # build stage and the runtime stage. Such a fault once shipped an attested image
+  # that could not load its own binary. The release workflow requires every job
+  # here to pass, so this job also gates the release.
+  image-boots:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: keygen:ci
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image boots
+        run: ./scripts/check-image-boots.sh keygen:ci
+
   # Full-history secret scan. History is clean at publication; this gate keeps
   # every commit clean after the repo is public.
   secret-scan:

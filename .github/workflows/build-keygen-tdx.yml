@@ -148,6 +148,15 @@ jobs:
           tags: ${{ vars.KEYGEN_IMAGE_REGISTRY }}:${{ inputs.tag }}
           provenance: false
 
+      # Run the exact pushed digest before it gets an attestation. The CI gate
+      # above ran the same check on a separate build of this commit. This step
+      # tests the image that partners pin. If it fails, the attest step does not
+      # run, and a partner check on this digest refuses it.
+      - name: Image boots
+        env:
+          IMAGE: ${{ vars.KEYGEN_IMAGE_REGISTRY }}@${{ steps.push.outputs.digest }}
+        run: ./scripts/check-image-boots.sh "${IMAGE}"
+
       # The certificate Fulcio issues names this repo, this workflow, the ref and
       # the commit. Those are the four fields the partner asserts at pin time.
       #
@@ -196,7 +205,9 @@ jobs:
               echo ">"
               echo "> The attestation step did not succeed, so no provenance exists"
               echo "> for this digest. A partner check on it fails, and the failure"
-              echo "> reads like tampering. Re-run the build."
+              echo "> reads like tampering. If the \"Image boots\" step failed, the"
+              echo "> image is broken: fix the build, do not re-run it. Otherwise"
+              echo "> re-run the build."
               echo
               echo "**Digest (for recovery only):**"
               echo

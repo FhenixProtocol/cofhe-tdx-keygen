@@ -9,7 +9,15 @@
 # Rust >= tfhe 1.5.1 MSRV (1.91.1). build-essential (cc) + cmake are required by
 # aws-lc-sys — the rustls crypto provider carrying ML-KEM for the pinned
 # TLS 1.3 + X25519MLKEM768 egress posture; rust:slim ships neither.
-FROM rust:1.94-slim@sha256:cf09adf8c3ebaba10779e5c23ff7fe4df4cccdab8a91f199b0c142c53fef3e1a AS build
+#
+# The build stage and the runtime stage must use the SAME Debian release. The
+# binary links against the glibc of the build stage, and a newer glibc can add
+# symbol versions that an older runtime does not have. The plain `rust:*-slim`
+# tag follows the newest Debian: a trixie (glibc 2.41) build of this binary
+# needed GLIBC_2.38, and the debian12 runtime (glibc 2.36) refused to load it.
+# So name the release in the tag. scripts/check-image-boots.sh runs the built
+# image in CI and before every release attestation.
+FROM rust:1.94-slim-bookworm@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential cmake \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
