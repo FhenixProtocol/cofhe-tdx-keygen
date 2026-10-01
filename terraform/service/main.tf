@@ -125,6 +125,26 @@ resource "google_storage_bucket_iam_member" "public_material_reader" {
   }
 }
 
+# Anonymous read of the public material, so anyone can fetch the evaluation key,
+# public key, CRS and manifest to verify results offline. IAM Conditions do not
+# accept allUsers, so the prefix scope comes from a managed folder instead: the
+# grant reaches objects under `${public_prefix}/` and nothing else in the bucket.
+# The folder holds only IAM; creating or destroying it never touches an object,
+# and force_destroy = false makes a destroy fail while objects remain under it.
+resource "google_storage_managed_folder" "public_material" {
+  count  = var.public_material_anonymous_read ? 1 : 0
+  bucket = local.public_bucket
+  name   = "${local.public_prefix}/"
+}
+
+resource "google_storage_managed_folder_iam_member" "public_material_anonymous" {
+  count          = var.public_material_anonymous_read ? 1 : 0
+  bucket         = google_storage_managed_folder.public_material[0].bucket
+  managed_folder = google_storage_managed_folder.public_material[0].name
+  role           = "roles/storage.objectViewer"
+  member         = "allUsers"
+}
+
 # --- The Confidential VM ------------------------------------------------
 # The keygen ceremony is a ONE-SHOT: this VM should exist only while a ceremony
 # is deliberately being run. It is gated behind `run_ceremony` (default false) so
