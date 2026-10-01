@@ -22,6 +22,20 @@ image="$1"
 # to that message must change this line too.
 expected='env var COFHE_ENV not set'
 
+# Pull a registry image first, with retries. A registry can briefly refuse a
+# manifest that was just pushed. A pull failure is an infrastructure fault, not
+# a boot fault, so it must not read as one.
+if ! docker image inspect "${image}" >/dev/null 2>&1; then
+  for attempt in 1 2 3; do
+    docker pull --platform linux/amd64 "${image}" && break
+    if [ "${attempt}" -eq 3 ]; then
+      echo "::error::could not pull ${image}. This is NOT a boot failure: the check did not run." >&2
+      exit 1
+    fi
+    sleep 10
+  done
+fi
+
 # The keygen must exit non-zero here. Capture the exit code without set -e
 # aborting the script.
 set +e
