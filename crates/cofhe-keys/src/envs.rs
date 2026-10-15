@@ -47,6 +47,26 @@ pub struct EnvConfig {
     /// Shamir reconstruction threshold (T). Baked once here so the producer's split
     /// and every consumer's reconstruct agree on T (N is the partner count).
     pub shamir_threshold: u8,
+    /// The partner set that holds the live shares, when the next keygen run is a
+    /// reshare. `partners` and `shamir_threshold` above are then the target set.
+    /// Consumers read no shares from this set, but their placeholder gate still
+    /// checks it (`ensure_partners_complete`). Remove it
+    /// once the reshare is done. An env that has it cannot run a ceremony.
+    pub reshare_from: Option<ReshareSource>,
+}
+
+/// The source of a reshare: the partner set that holds the live shares, the
+/// threshold those shares were split with, and an anchor on the live keyset.
+///
+/// The anchor is the two signer addresses of the live keyset. They are public and
+/// on-chain. The reshare refuses a manifest whose addresses differ, so a bucket
+/// writer cannot swap in an older keyset's manifest, and with it an older key, for
+/// the run to split again.
+pub struct ReshareSource {
+    pub partners: &'static [EnvPartner],
+    pub shamir_threshold: u8,
+    pub decrypt_signer_address: &'static str,
+    pub zk_signer_address: &'static str,
 }
 
 const STAGING: EnvConfig = EnvConfig {
@@ -82,6 +102,7 @@ const STAGING: EnvConfig = EnvConfig {
     public_prefix: "generator/keys/versionized",
     public_zone: 0,
     shamir_threshold: 2,
+    reshare_from: None,
 };
 
 const TESTNET: EnvConfig = EnvConfig {
@@ -107,6 +128,7 @@ const TESTNET: EnvConfig = EnvConfig {
     public_prefix: "generator/keys/versionized",
     public_zone: 0,
     shamir_threshold: 2,
+    reshare_from: None,
 };
 
 /// The mainnet partner set: six key-share holders, threshold 3. Each runs the partner
@@ -122,11 +144,12 @@ const TESTNET: EnvConfig = EnvConfig {
 /// A project name is chosen by its operator and identifies no one — do not read
 /// ownership, or a guarantee of third-party independence, off these strings.
 ///
-/// Changing the partner set is NOT a config change. It is: edit the entries below,
-/// rebuild every consumer (the source is compile-time), re-pin the new consumer
-/// digests in the env's `keygen-partners` var-file, and have all six partners
-/// re-apply the partner stack. Plan for that sequence — there is no shortcut that
-/// skips the rebuild.
+/// Changing the partner set is NOT a config change. It is: put the current set in
+/// `reshare_from`, edit the entries below to the new set, rebuild every consumer
+/// (the source is compile-time), re-pin the new consumer digests in the env's
+/// `keygen-partners` var-file, have the partners re-apply the partner stack, and
+/// run a reshare. Then remove `reshare_from`. Plan for that sequence — there is no
+/// shortcut that skips the rebuild.
 const MAINNET: EnvConfig = EnvConfig {
     partners: &[
         EnvPartner {
@@ -170,6 +193,7 @@ const MAINNET: EnvConfig = EnvConfig {
     public_prefix: "generator/keys/versionized",
     public_zone: 0,
     shamir_threshold: 3,
+    reshare_from: None,
 };
 
 /// Marks a partner slot that is declared but not yet filled in. A slot keeps the
@@ -186,9 +210,11 @@ impl EnvConfig {
     /// paths that actually touch the partner set: the ceremony's config build and the
     /// reader's reconstruct. Both call this.
     pub fn ensure_partners_complete(&self) -> Result<()> {
+        let sources = self.reshare_from.iter().flat_map(|r| r.partners.iter());
         let pending: Vec<&str> = self
             .partners
             .iter()
+            .chain(sources)
             .filter(|p| {
                 p.project_id.starts_with(PARTNER_PLACEHOLDER)
                     || p.wip_pool_audience.contains(PARTNER_PLACEHOLDER)
@@ -342,6 +368,7 @@ mod tests {
             public_prefix: "p",
             public_zone: 0,
             shamir_threshold: 2,
+            reshare_from: None,
         }
     }
 
@@ -373,6 +400,37 @@ mod tests {
             .into_boxed_slice(),
         );
         assert!(env_with(ps).ensure_partners_complete().is_err());
+    }
+
+    // A reshare reads from the source set, so an open slot there must fail too.
+    #[test]
+    fn an_open_slot_in_the_reshare_source_fails_the_gate() {
+        let target: &'static [EnvPartner] = Box::leak(
+            vec![
+                partner("real-1", "111111111111"),
+                partner("real-2", "222222222222"),
+            ]
+            .into_boxed_slice(),
+        );
+        let source: &'static [EnvPartner] = Box::leak(
+            vec![
+                partner("real-1", "111111111111"),
+                partner("FILL-ME-PARTNER-3", "333333333333"),
+            ]
+            .into_boxed_slice(),
+        );
+        let mut env = env_with(target);
+        env.reshare_from = Some(ReshareSource {
+            partners: source,
+            shamir_threshold: 2,
+            decrypt_signer_address: "0x1111111111111111111111111111111111111111",
+            zk_signer_address: "0x2222222222222222222222222222222222222222",
+        });
+        let err = env
+            .ensure_partners_complete()
+            .expect_err("an open source slot must fail closed")
+            .to_string();
+        assert!(err.contains("FILL-ME-PARTNER-3"), "{err}");
     }
 
     #[test]

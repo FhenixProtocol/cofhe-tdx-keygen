@@ -32,7 +32,10 @@ Invariants — do not break these (see `DESIGN.md` for the rationale behind each
   shares aborts the run.
 - The wire format is the single source of truth; the writer and reader hash
   byte-identical bytes.
-- Each run is a fresh keyset, all-or-nothing.
+- A ceremony run is a fresh keyset; a reshare run keeps the live keyset and
+  only splits it again. Both are all-or-nothing.
+- `KEYGEN_MODE` must agree with the baked env: an env with `reshare_from` runs
+  only a reshare, and an env without it runs only a ceremony.
 
 Writing docs and comments: active voice, present tense, one idea per sentence,
 simple words. State operator cautions as instructions, not alarms. Never claim an
