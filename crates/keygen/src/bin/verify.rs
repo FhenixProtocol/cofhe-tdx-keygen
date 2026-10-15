@@ -13,7 +13,7 @@ use cofhe_keys::gcs::GcsClient;
 use cofhe_keys::reader::{
     lookup, partner_refs, read_fhe_priv, read_zk_signer, PartnerAccess, PartnerRef, ReaderContext,
 };
-use cofhe_keys::secrets::SecretManager;
+use cofhe_keys::secrets::{SecretManager, SecretVersion};
 use cofhe_keys::serialization::{self, SecretEnvelope};
 
 const SM_URL: &str = "https://secretmanager.googleapis.com";
@@ -119,8 +119,13 @@ async fn main() -> Result<()> {
     let args = parse_args()?;
 
     let sm = SecretManager::new(&args.sm_url);
-    let raw = sm
-        .access(&args.token, &args.project, &args.secret)
+    let (_, raw) = sm
+        .access_version(
+            &args.token,
+            &args.project,
+            &args.secret,
+            SecretVersion::Latest,
+        )
         .await
         .context("read envelope from Secret Manager")?;
     let envelope =
