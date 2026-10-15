@@ -16,6 +16,7 @@
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
+use zeroize::{Zeroize, Zeroizing};
 
 const ENVELOPE_VERSION: u8 = 1;
 // Monotonic single-byte version (semver buys nothing here: the decoder is strict and
@@ -142,6 +143,9 @@ fn expect_consumed(pos: usize, buf: &[u8]) -> Result<()> {
 // memory, no untrusted swap), and consumers hold the keys for their whole
 // lifetime — so zeroize-on-drop would only fire at shutdown ≈ process death,
 // where the OS reclaims memory anyway. It would buy nothing concrete here.
+// They derive `Zeroize` (not `ZeroizeOnDrop`) so a reshare can wipe the rebuilt
+// key before its network writes. No `Drop` is added, so consumers can still move
+// fields out.
 
 const FHE_PRIV_VERSION: u8 = 1;
 const ZK_SIGNER_VERSION: u8 = 1;
@@ -150,7 +154,7 @@ const ZK_SIGNER_VERSION: u8 = 1;
 /// decrypt-path signer scalar. Written to its **own** Secret Manager secret so
 /// only TeeCryptor's reader is granted access — the ZK verifier never sees the
 /// decryption key. See `CONSUMER-INTEGRATION.md`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize)]
 pub struct FhePrivShare {
     pub client_key: Vec<u8>,
     pub decrypt_signer_priv: Vec<u8>,
@@ -182,14 +186,14 @@ impl FhePrivShare {
     /// SHA-256 over the canonical bytes — what this secret's provenance binds.
     pub fn hash(&self) -> [u8; 32] {
         let mut h = Sha256::new();
-        h.update(self.to_canonical_bytes());
+        h.update(Zeroizing::new(self.to_canonical_bytes()).as_slice());
         h.finalize().into()
     }
 }
 
 /// The ZK verifier's audience component: only its signer scalar. Written to its
 /// **own** Secret Manager secret; the verifier never receives the FHE priv.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize)]
 pub struct ZkSignerShare {
     pub zk_signer_priv: Vec<u8>,
 }
@@ -215,7 +219,7 @@ impl ZkSignerShare {
     /// SHA-256 over the canonical bytes — what this secret's provenance binds.
     pub fn hash(&self) -> [u8; 32] {
         let mut h = Sha256::new();
-        h.update(self.to_canonical_bytes());
+        h.update(Zeroizing::new(self.to_canonical_bytes()).as_slice());
         h.finalize().into()
     }
 }
@@ -261,6 +265,21 @@ pub struct PublicMaterial {
 }
 
 impl PublicMaterial {
+    /// The same manifest for a new partner set: every field stays, except the two
+    /// per-share digest lists. A reshare publishes this, so readers reject every
+    /// share that is not part of the new split.
+    pub fn with_share_digests(
+        &self,
+        fhe_priv_share_digests: Vec<(String, [u8; 32])>,
+        zk_signer_share_digests: Vec<(String, [u8; 32])>,
+    ) -> Self {
+        Self {
+            fhe_priv_share_digests,
+            zk_signer_share_digests,
+            ..self.clone()
+        }
+    }
+
     pub fn to_canonical_bytes(&self) -> Vec<u8> {
         let mut out = vec![PUBLIC_VERSION];
         put_field(&mut out, &self.server_key_digest);
@@ -393,6 +412,36 @@ impl SecretEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_share_digests_changes_only_the_two_lists() {
+        let old = PublicMaterial {
+            server_key_digest: [1; 32],
+            compact_public_key_digest: [2; 32],
+            crs_digest: [3; 32],
+            decrypt_signer_address: "0xaa".into(),
+            zk_signer_address: "0xbb".into(),
+            fhe_priv_digest: [4; 32],
+            zk_signer_digest: [5; 32],
+            fhe_priv_share_digests: vec![("old".into(), [6; 32])],
+            zk_signer_share_digests: vec![("old".into(), [7; 32])],
+        };
+        let fhe = vec![
+            ("new-1".to_string(), [8; 32]),
+            ("new-2".to_string(), [9; 32]),
+        ];
+        let zk = vec![
+            ("new-1".to_string(), [10; 32]),
+            ("new-2".to_string(), [11; 32]),
+        ];
+        let new = old.with_share_digests(fhe.clone(), zk.clone());
+        assert_eq!(new.fhe_priv_share_digests, fhe);
+        assert_eq!(new.zk_signer_share_digests, zk);
+        let mut back = new.clone();
+        back.fhe_priv_share_digests = old.fhe_priv_share_digests.clone();
+        back.zk_signer_share_digests = old.zk_signer_share_digests.clone();
+        assert_eq!(back, old);
+    }
 
     #[test]
     fn public_round_trips() {

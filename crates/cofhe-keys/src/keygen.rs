@@ -21,16 +21,17 @@ use tfhe::shortint::parameters::PARAM_MESSAGE_2_CARRY_2_KS_PBS;
 use tfhe::zk::CompactPkeCrs;
 use tfhe::{ClientKey, CompactPublicKey, CompressedServerKey, ConfigBuilder};
 use tracing::info;
+use zeroize::{Zeroize, Zeroizing};
 
-use crate::serialization::{sha256, FhePrivShare, PublicMaterial, ZkSignerShare};
+use crate::serialization::{sha256, verify_artifact, FhePrivShare, PublicMaterial, ZkSignerShare};
 use crate::shamir;
 
 /// One partner's pair of Shamir share blobs (index-aligned to the `partner_ids`
-/// passed to [`generate`]): the partner gets share `i` of the FHE-priv secret and
-/// share `i` of the ZK-signer secret. Each blob is the canonical bytes of a
-/// `Gf256` share (1 participant-id byte + GF(256) y-bytes), written into that
-/// partner's two Secret Manager secrets and never combined inside the enclave.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// passed to [`split_for_partners`]): the partner gets share `i` of the FHE-priv
+/// secret and share `i` of the ZK-signer secret. Each blob is the canonical bytes
+/// of a `Gf256` share (1 participant-id byte + GF(256) y-bytes), written into that
+/// partner's two Secret Manager secrets.
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize)]
 pub struct PartnerShares {
     pub fhe_priv_share: Vec<u8>,
     pub zk_signer_share: Vec<u8>,
@@ -105,6 +106,13 @@ fn self_test_coherent(
     Ok(())
 }
 
+/// Production FHE parameters. They must match the rest of the network exactly.
+fn network_config() -> tfhe::Config {
+    ConfigBuilder::with_custom_parameters(PARAM_MESSAGE_2_CARRY_2_KS_PBS)
+        .use_dedicated_compact_public_key_parameters((CPK_PARAMS, CASTING_PARAMS))
+        .build()
+}
+
 /// Generate the keyset and Shamir-split each per-audience secret component across
 /// the partners.
 ///
@@ -137,9 +145,7 @@ pub fn generate(
     }
 
     // Production FHE parameters — must match the rest of the network exactly.
-    let config = ConfigBuilder::with_custom_parameters(PARAM_MESSAGE_2_CARRY_2_KS_PBS)
-        .use_dedicated_compact_public_key_parameters((CPK_PARAMS, CASTING_PARAMS))
-        .build();
+    let config = network_config();
 
     info!("keygen: generating FHE ClientKey (priv)");
     let client_key = ClientKey::generate(config);
@@ -180,42 +186,7 @@ pub fn generate(
         zk_signer_priv: zk_signer.to_bytes().to_vec(),
     };
 
-    // Shamir-split each secret's canonical bytes into N blobs (T-of-N). One CSPRNG
-    // per split — OS-seeded once and reused across the many bytes a ~40 KB split
-    // draws (see `shamir::new_csprng`). Share `i` belongs to `partner_ids[i]`.
-    info!(
-        shares,
-        threshold,
-        partners = partner_ids.len(),
-        "keygen: Shamir-splitting per-audience secrets"
-    );
-    let fhe_blobs = shamir::split(
-        &fhe_priv.to_canonical_bytes(),
-        shares,
-        threshold,
-        &mut shamir::new_csprng(),
-    )
-    .context("split FHE-priv secret")?;
-    let zk_blobs = shamir::split(
-        &zk_share.to_canonical_bytes(),
-        shares,
-        threshold,
-        &mut shamir::new_csprng(),
-    )
-    .context("split ZK-signer secret")?;
-
-    // Per-partner digests key SHA-256(share blob) by partner IDENTITY (not position),
-    // so a reconstructing consumer can exclude a tampered/stale partner UP FRONT.
-    let fhe_priv_share_digests: Vec<(String, [u8; 32])> = partner_ids
-        .iter()
-        .zip(&fhe_blobs)
-        .map(|(id, blob)| (id.clone(), sha256(blob)))
-        .collect();
-    let zk_signer_share_digests: Vec<(String, [u8; 32])> = partner_ids
-        .iter()
-        .zip(&zk_blobs)
-        .map(|(id, blob)| (id.clone(), sha256(blob)))
-        .collect();
+    let split = split_for_partners(&fhe_priv, &zk_share, partner_ids, shares, threshold)?;
 
     // safe_serialize the three public artifacts once; their bytes go to standalone
     // GCS objects and their SHA-256 digests go into the attested manifest below.
@@ -238,19 +209,10 @@ pub fn generate(
         fhe_priv_digest: fhe_priv.hash(),
         zk_signer_digest: zk_share.hash(),
         // Per-partner `(project_id, SHA-256(share))` lists for the split ceremony.
-        fhe_priv_share_digests,
-        zk_signer_share_digests,
+        fhe_priv_share_digests: split.fhe_priv_share_digests,
+        zk_signer_share_digests: split.zk_signer_share_digests,
     };
-
-    // Pair each partner's two share blobs, index-aligned to `partner_ids`.
-    let partner_shares: Vec<PartnerShares> = fhe_blobs
-        .into_iter()
-        .zip(zk_blobs)
-        .map(|(fhe_priv_share, zk_signer_share)| PartnerShares {
-            fhe_priv_share,
-            zk_signer_share,
-        })
-        .collect();
+    let partner_shares = split.partner_shares;
 
     info!(
         client_key_bytes = fhe_priv.client_key.len(),
@@ -262,6 +224,170 @@ pub fn generate(
     );
 
     Ok((partner_shares, artifacts, public))
+}
+
+/// One partner set's shares of both secrets, with the per-partner digest lists the
+/// manifest publishes. Index `i` of every field belongs to `partner_ids[i]`.
+pub struct SplitOutput {
+    pub partner_shares: Vec<PartnerShares>,
+    pub fhe_priv_share_digests: Vec<(String, [u8; 32])>,
+    pub zk_signer_share_digests: Vec<(String, [u8; 32])>,
+}
+
+/// Shamir-split both secrets for one partner set, T-of-N. A ceremony calls this on
+/// a new keyset; a reshare calls it on the live keyset with the target set. Each
+/// split draws a fresh OS-seeded CSPRNG, so new shares have no relation to any
+/// earlier split of the same secret.
+pub fn split_for_partners(
+    fhe_priv: &FhePrivShare,
+    zk_share: &ZkSignerShare,
+    partner_ids: &[String],
+    shares: u8,
+    threshold: u8,
+) -> Result<SplitOutput> {
+    if partner_ids.len() != shares as usize {
+        bail!(
+            "split: {} partner ids but {} shares (must be equal)",
+            partner_ids.len(),
+            shares
+        );
+    }
+    info!(
+        shares,
+        threshold,
+        partners = partner_ids.len(),
+        "keygen: Shamir-splitting per-audience secrets"
+    );
+    // One CSPRNG per split — OS-seeded once and reused across the many bytes a
+    // ~40 KB split draws (see `shamir::new_csprng`). Share `i` belongs to
+    // `partner_ids[i]`.
+    let fhe_blobs = shamir::split(
+        &Zeroizing::new(fhe_priv.to_canonical_bytes()),
+        shares,
+        threshold,
+        &mut shamir::new_csprng(),
+    )
+    .context("split FHE-priv secret")?;
+    let zk_blobs = shamir::split(
+        &Zeroizing::new(zk_share.to_canonical_bytes()),
+        shares,
+        threshold,
+        &mut shamir::new_csprng(),
+    )
+    .context("split ZK-signer secret")?;
+
+    // Per-partner digests key SHA-256(share blob) by partner IDENTITY (not position),
+    // so a reconstructing consumer can exclude a tampered/stale partner UP FRONT.
+    let digests = |blobs: &[Vec<u8>]| -> Vec<(String, [u8; 32])> {
+        partner_ids
+            .iter()
+            .zip(blobs)
+            .map(|(id, blob)| (id.clone(), sha256(blob)))
+            .collect()
+    };
+    let fhe_priv_share_digests = digests(&fhe_blobs);
+    let zk_signer_share_digests = digests(&zk_blobs);
+
+    let partner_shares = fhe_blobs
+        .into_iter()
+        .zip(zk_blobs)
+        .map(|(fhe_priv_share, zk_signer_share)| PartnerShares {
+            fhe_priv_share,
+            zk_signer_share,
+        })
+        .collect();
+    Ok(SplitOutput {
+        partner_shares,
+        fhe_priv_share_digests,
+        zk_signer_share_digests,
+    })
+}
+
+/// Prove that a reconstructed key is the key behind the live public data, before a
+/// reshare writes anything. The public artifacts cannot be regenerated byte for
+/// byte (their keygen is randomized, and the CRS does not depend on the key), so
+/// the check is in four parts:
+///
+/// 1. Each artifact's SHA-256 matches its manifest digest.
+/// 2. Each secret's SHA-256 matches its full-key manifest digest.
+/// 3. Both signer addresses derive from the private scalars.
+/// 4. The reconstructed ClientKey decrypts what the published CompactPublicKey
+///    encrypts. It also decrypts a homomorphic add under the published ServerKey.
+///    The add runs a PBS, so it covers the bootstrapping key and not only the
+///    casting key.
+pub fn verify_against_public(
+    fhe_priv: &FhePrivShare,
+    zk_share: &ZkSignerShare,
+    public: &PublicMaterial,
+    artifacts: &PublicArtifacts,
+) -> Result<()> {
+    verify_artifact(
+        &artifacts.server_key,
+        &public.server_key_digest,
+        "server key",
+    )?;
+    verify_artifact(
+        &artifacts.compact_public_key,
+        &public.compact_public_key_digest,
+        "compact public key",
+    )?;
+    verify_artifact(&artifacts.crs, &public.crs_digest, "crs")?;
+    if fhe_priv.hash() != public.fhe_priv_digest {
+        bail!("the FHE-priv secret does not match its full-key manifest digest");
+    }
+    if zk_share.hash() != public.zk_signer_digest {
+        bail!("the ZK-signer secret does not match its full-key manifest digest");
+    }
+    for (name, scalar, address) in [
+        (
+            "decrypt signer",
+            &fhe_priv.decrypt_signer_priv,
+            &public.decrypt_signer_address,
+        ),
+        (
+            "zk signer",
+            &zk_share.zk_signer_priv,
+            &public.zk_signer_address,
+        ),
+    ] {
+        let sk = SigningKey::from_slice(scalar).with_context(|| format!("decode {name}"))?;
+        if evm_address(&sk) != *address {
+            bail!("the {name} scalar does not derive the published {name} address");
+        }
+    }
+
+    let client_key: ClientKey = safe_de(&fhe_priv.client_key).context("decode ClientKey")?;
+    let public_key: CompactPublicKey =
+        safe_de(&artifacts.compact_public_key).context("decode published CompactPublicKey")?;
+    let server_key: CompressedServerKey =
+        safe_de(&artifacts.server_key).context("decode published ServerKey")?;
+    self_test_coherent(&client_key, &public_key, &server_key)
+        .context("the reconstructed ClientKey does not match the published public keys")?;
+    self_test_bootstrap(&client_key)
+        .context("the reconstructed ClientKey does not match the published ServerKey")?;
+    Ok(())
+}
+
+fn safe_de<T>(bytes: &[u8]) -> Result<T>
+where
+    T: serde::de::DeserializeOwned + tfhe::Unversionize + tfhe::named::Named,
+{
+    tfhe::safe_serialization::safe_deserialize(bytes, SAFE_SER_LIMIT)
+        .map_err(|e| anyhow::anyhow!("safe_deserialize: {e}"))
+}
+
+/// Add two ciphertexts under the server key that `self_test_coherent` installed.
+/// The carry propagation runs a PBS, which fails to decrypt correctly when the
+/// bootstrapping key belongs to another ClientKey.
+fn self_test_bootstrap(client_key: &ClientKey) -> Result<()> {
+    use tfhe::prelude::*;
+    let a = tfhe::FheUint8::encrypt(117u8, client_key);
+    let b = tfhe::FheUint8::encrypt(58u8, client_key);
+    let sum: u8 = (&a + &b).decrypt(client_key);
+    if sum != 117u8.wrapping_add(58) {
+        bail!("homomorphic add decrypted to {sum}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -294,7 +420,48 @@ mod tests {
         );
     }
 
-    // Slow: generates a real keyset (FHE keygen + CRS) and splits it 5 ways.
+    #[test]
+    fn split_for_partners_round_trips_with_a_new_n_and_t() {
+        let fhe = FhePrivShare {
+            client_key: b"synthetic client key".to_vec(),
+            decrypt_signer_priv: vec![7u8; 32],
+        };
+        let zk = ZkSignerShare {
+            zk_signer_priv: vec![9u8; 32],
+        };
+        let ids: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+        let out = split_for_partners(&fhe, &zk, &ids, 4, 3).unwrap();
+        assert_eq!(out.partner_shares.len(), 4);
+        let listed: Vec<&str> = out
+            .fhe_priv_share_digests
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert_eq!(listed, ["a", "b", "c", "d"]);
+        // Any 3 of the 4 new shares rebuild the same payload.
+        let blobs: Vec<Vec<u8>> = out.partner_shares[1..]
+            .iter()
+            .map(|p| p.fhe_priv_share.clone())
+            .collect();
+        assert_eq!(
+            shamir::reconstruct(&blobs, 3).unwrap(),
+            fhe.to_canonical_bytes()
+        );
+        let blobs: Vec<Vec<u8>> = out.partner_shares[..3]
+            .iter()
+            .map(|p| p.zk_signer_share.clone())
+            .collect();
+        assert_eq!(
+            shamir::reconstruct(&blobs, 3).unwrap(),
+            zk.to_canonical_bytes()
+        );
+        // A count mismatch is rejected.
+        assert!(split_for_partners(&fhe, &zk, &ids, 3, 2).is_err());
+    }
+
+    // Slow: generates a real keyset (FHE keygen + CRS) and splits it 5 ways. The one
+    // real keyset of the suite, so it also runs the live-key checks a reshare runs
+    // before it writes, and a ceremony-then-reshare round trip through the reader.
     // Validates the recipe, the per-partner digest lists, and the 64 KiB Secret
     // Manager fit for each per-audience share envelope.
     #[test]
@@ -386,5 +553,123 @@ mod tests {
             "fhe-priv share envelope {} bytes exceeds the 64 KiB Secret Manager cap",
             env_bytes.len()
         );
+
+        check_live_key(&fhe_priv, &zk_share, &public, &artifacts);
+        #[cfg(feature = "reader")]
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(reshare_round_trip(&fhe_priv, &zk_share, &public));
+    }
+
+    // The key matches the published keys and signers, and each kind of mismatch is
+    // caught before a reshare writes anything.
+    fn check_live_key(
+        fhe: &FhePrivShare,
+        zk: &ZkSignerShare,
+        public: &PublicMaterial,
+        artifacts: &PublicArtifacts,
+    ) {
+        verify_against_public(fhe, zk, public, artifacts).unwrap();
+
+        let mut swapped = artifacts.clone();
+        std::mem::swap(&mut swapped.crs, &mut swapped.compact_public_key);
+        assert!(verify_against_public(fhe, zk, public, &swapped).is_err());
+
+        let mut wrong_signer = public.clone();
+        wrong_signer.zk_signer_address = public.decrypt_signer_address.clone();
+        assert!(verify_against_public(fhe, zk, &wrong_signer, artifacts).is_err());
+
+        // A ClientKey from another keyset, with a manifest that claims it. Only the
+        // check against the published keys can catch this.
+        let other = FhePrivShare {
+            client_key: safe_ser(&ClientKey::generate(network_config())).unwrap(),
+            decrypt_signer_priv: fhe.decrypt_signer_priv.clone(),
+        };
+        let mut claims_other = public.clone();
+        claims_other.fhe_priv_digest = other.hash();
+        let err = verify_against_public(&other, zk, &claims_other, artifacts)
+            .expect_err("a foreign ClientKey must not match the published keys");
+        assert!(
+            format!("{err:#}").contains("ClientKey does not match the published"),
+            "{err:#}"
+        );
+    }
+
+    // The design's end-to-end check: this ceremony's keyset, resharded to a new
+    // 3-of-4 set. The reader on the new set returns both secrets byte for byte.
+    #[cfg(feature = "reader")]
+    async fn reshare_round_trip(fhe: &FhePrivShare, zk: &ZkSignerShare, live: &PublicMaterial) {
+        use crate::gcs::GcsClient;
+        use crate::reader::{
+            read_fhe_priv, read_zk_signer, PartnerAccess, PartnerRef, ReaderContext,
+        };
+        use crate::secrets::SecretManager;
+        use base64::Engine as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let ids: Vec<String> = ["b", "c", "d", "e"].iter().map(|s| s.to_string()).collect();
+        let split = split_for_partners(fhe, zk, &ids, 4, 3).unwrap();
+        let resharded =
+            live.with_share_digests(split.fhe_priv_share_digests, split.zk_signer_share_digests);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/storage/v1/b/bucket/o/public-material"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(resharded.to_canonical_bytes()))
+            .mount(&server)
+            .await;
+        for (id, share) in ids.iter().zip(&split.partner_shares) {
+            for (secret, bytes) in [
+                ("fhe", &share.fhe_priv_share),
+                ("zk", &share.zk_signer_share),
+            ] {
+                let envelope = crate::serialization::SecretEnvelope {
+                    payload: bytes.clone(),
+                    provenance_jwt: String::new(),
+                };
+                let data =
+                    base64::engine::general_purpose::STANDARD.encode(envelope.to_canonical_bytes());
+                Mock::given(method("GET"))
+                    .and(path(format!(
+                        "/v1/projects/{id}/secrets/{secret}/versions/latest:access"
+                    )))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({ "name": "v", "payload": { "data": data } }),
+                    ))
+                    .mount(&server)
+                    .await;
+            }
+        }
+        let refs = |secret: &str| -> Vec<PartnerRef> {
+            ids.iter()
+                .map(|id| PartnerRef {
+                    project_id: id.clone(),
+                    secret_id: secret.to_string(),
+                    wip_audience: String::new(),
+                })
+                .collect()
+        };
+        let (fhe_refs, zk_refs) = (refs("fhe"), refs("zk"));
+        let sm = SecretManager::new(server.uri());
+        let gcs = GcsClient::new(server.uri());
+        let ctx = ReaderContext {
+            sm: &sm,
+            gcs: &gcs,
+            gcs_token: "t",
+            public_bucket: "bucket",
+            public_object: "public-material",
+        };
+        fn access(refs: &[PartnerRef]) -> Vec<PartnerAccess<'_>> {
+            refs.iter()
+                .map(|partner| PartnerAccess {
+                    partner,
+                    sm_token: "t",
+                })
+                .collect()
+        }
+        let got_fhe = read_fhe_priv(&ctx, &access(&fhe_refs), 3).await.unwrap();
+        let got_zk = read_zk_signer(&ctx, &access(&zk_refs), 3).await.unwrap();
+        assert_eq!(got_fhe.to_canonical_bytes(), fhe.to_canonical_bytes());
+        assert_eq!(got_zk.to_canonical_bytes(), zk.to_canonical_bytes());
     }
 }
