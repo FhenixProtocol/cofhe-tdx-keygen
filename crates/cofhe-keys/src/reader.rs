@@ -25,13 +25,13 @@
 //! [`read_zk_signer`] route through the fault-tolerant path.
 
 use anyhow::{anyhow, bail, Context, Result};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use std::collections::BTreeSet;
 use std::time::Duration;
 
 use crate::gcs::GcsClient;
-use crate::secrets::SecretManager;
+use crate::secrets::{SecretManager, SecretVersion};
 use crate::serialization::{self, FhePrivShare, PublicMaterial, SecretEnvelope, ZkSignerShare};
 use crate::shamir;
 
@@ -70,15 +70,24 @@ pub struct PartnerRef {
 pub fn partner_refs(env: &EnvConfig, consumer: &str, secret_id: &str) -> Result<Vec<PartnerRef>> {
     env.ensure_partners_complete()
         .context("refusing to build partner references")?;
-    Ok(env
-        .partners
+    Ok(partner_refs_for(env.partners, consumer, secret_id))
+}
+
+/// [`partner_refs`] for a partner slice other than an env's target set, such as
+/// the source set of a reshare. The caller must reject placeholder slots first.
+pub fn partner_refs_for(
+    partners: &[EnvPartner],
+    consumer: &str,
+    secret_id: &str,
+) -> Vec<PartnerRef> {
+    partners
         .iter()
         .map(|p| PartnerRef {
             project_id: p.project_id.to_string(),
             secret_id: secret_id.to_string(),
             wip_audience: format!("{}/providers/{consumer}-reader", p.wip_pool_audience),
         })
-        .collect())
+        .collect()
 }
 
 /// One partner + the caller-obtained SM bearer for THAT partner. SM tokens are
@@ -107,8 +116,19 @@ pub async fn read_share(
     sm_token: &str,
     partner: &PartnerRef,
 ) -> Result<Vec<u8>> {
-    let raw = sm
-        .access(sm_token, &partner.project_id, &partner.secret_id)
+    read_share_at(sm, sm_token, partner, SecretVersion::Latest).await
+}
+
+// One partner's share at one version. Logs the version Secret Manager resolved, so
+// an operator can pin the same shares on a rerun.
+async fn read_share_at(
+    sm: &SecretManager,
+    sm_token: &str,
+    partner: &PartnerRef,
+    version: SecretVersion,
+) -> Result<Vec<u8>> {
+    let (name, raw) = sm
+        .access_version(sm_token, &partner.project_id, &partner.secret_id, version)
         .await
         .with_context(|| {
             format!(
@@ -116,6 +136,7 @@ pub async fn read_share(
                 partner.secret_id, partner.project_id
             )
         })?;
+    tracing::info!(partner = %partner.project_id, version = %name, "read share");
     let envelope = SecretEnvelope::from_canonical_bytes(raw.as_slice())
         .with_context(|| format!("decode envelope for partner {}", partner.project_id))?;
     Ok(envelope.payload)
@@ -159,21 +180,22 @@ pub async fn read_public(
 /// and `failed` is the excluded partner ids.
 ///
 /// Uses [`futures::future::join_all`] (NOT `try_join_all`, which fails fast) so all
-/// results come back before partitioning. [`read_share`] remains the per-partner
+/// results come back before partitioning. [`read_share_at`] is the per-partner
 /// unit; bad/stale share bytes are caught downstream by the per-share digest filter.
 async fn fetch_all(
     sm: &SecretManager,
     partners: &[PartnerAccess<'_>],
+    version_of: &dyn Fn(&str) -> SecretVersion,
 ) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
     let results = futures::future::join_all(partners.iter().map(|a| async move {
         // Per-partner timeout: a hung partner must not stall the whole gather. On
         // timeout it's treated as a failure -> excluded, and we reconstruct from the
         // other T good shares (join_all still waits for the rest, capped at this).
-        let r =
-            match tokio::time::timeout(READ_TIMEOUT, read_share(sm, a.sm_token, a.partner)).await {
-                Ok(res) => res,
-                Err(_) => Err(anyhow!("partner fetch timed out after {READ_TIMEOUT:?}")),
-            };
+        let read = read_share_at(sm, a.sm_token, a.partner, version_of(&a.partner.project_id));
+        let r = match tokio::time::timeout(READ_TIMEOUT, read).await {
+            Ok(res) => res,
+            Err(_) => Err(anyhow!("partner fetch timed out after {READ_TIMEOUT:?}")),
+        };
         (a.partner.project_id.clone(), r)
     }))
     .await;
@@ -299,6 +321,7 @@ async fn read_reconstruct_validate(
     select_share_digests: impl Fn(&PublicMaterial) -> Vec<(String, [u8; 32])>,
     select_full_digest: impl Fn(&PublicMaterial) -> [u8; 32],
     label: &str,
+    version_of: &dyn Fn(&str) -> SecretVersion,
 ) -> Result<Vec<u8>> {
     // Fail-closed on an unfilled partner slot. Without this the tolerant gather would
     // simply drop the placeholder partners and reconstruct from whatever real ones
@@ -327,7 +350,7 @@ async fn read_reconstruct_validate(
     let public =
         PublicMaterial::from_canonical_bytes(&public_bytes).context("decode public material")?;
 
-    let (mut successes, fetch_failed) = fetch_all(ctx.sm, partners).await;
+    let (mut successes, fetch_failed) = fetch_all(ctx.sm, partners, version_of).await;
 
     let share_digests = select_share_digests(&public);
     let full_digest = select_full_digest(&public);
@@ -374,15 +397,29 @@ pub async fn read_fhe_priv(
     partners: &[PartnerAccess<'_>],
     threshold: u8,
 ) -> Result<FhePrivShare> {
-    let payload = read_reconstruct_validate(
-        ctx,
-        partners,
-        threshold,
-        |p| p.fhe_priv_share_digests.clone(),
-        |p| p.fhe_priv_digest,
-        "fhe-priv",
-    )
-    .await?;
+    read_fhe_priv_at(ctx, partners, threshold, &|_| SecretVersion::Latest).await
+}
+
+/// [`read_fhe_priv`] at a chosen version per partner (keyed by project id). The
+/// keygen reshare uses it to rerun on the same shares after a stop mid-write.
+pub async fn read_fhe_priv_at(
+    ctx: &ReaderContext<'_>,
+    partners: &[PartnerAccess<'_>],
+    threshold: u8,
+    version_of: &dyn Fn(&str) -> SecretVersion,
+) -> Result<FhePrivShare> {
+    let payload = Zeroizing::new(
+        read_reconstruct_validate(
+            ctx,
+            partners,
+            threshold,
+            |p| p.fhe_priv_share_digests.clone(),
+            |p| p.fhe_priv_digest,
+            "fhe-priv",
+            version_of,
+        )
+        .await?,
+    );
     FhePrivShare::from_canonical_bytes(&payload).context("decode FhePrivShare")
 }
 
@@ -393,15 +430,28 @@ pub async fn read_zk_signer(
     partners: &[PartnerAccess<'_>],
     threshold: u8,
 ) -> Result<ZkSignerShare> {
-    let payload = read_reconstruct_validate(
-        ctx,
-        partners,
-        threshold,
-        |p| p.zk_signer_share_digests.clone(),
-        |p| p.zk_signer_digest,
-        "zk-signer",
-    )
-    .await?;
+    read_zk_signer_at(ctx, partners, threshold, &|_| SecretVersion::Latest).await
+}
+
+/// [`read_zk_signer`] at a chosen version per partner (keyed by project id).
+pub async fn read_zk_signer_at(
+    ctx: &ReaderContext<'_>,
+    partners: &[PartnerAccess<'_>],
+    threshold: u8,
+    version_of: &dyn Fn(&str) -> SecretVersion,
+) -> Result<ZkSignerShare> {
+    let payload = Zeroizing::new(
+        read_reconstruct_validate(
+            ctx,
+            partners,
+            threshold,
+            |p| p.zk_signer_share_digests.clone(),
+            |p| p.zk_signer_digest,
+            "zk-signer",
+            version_of,
+        )
+        .await?,
+    );
     ZkSignerShare::from_canonical_bytes(&payload).context("decode ZkSignerShare")
 }
 
@@ -916,6 +966,55 @@ mod tests {
         assert_eq!(got, fhe);
     }
 
+    // A pinned read asks Secret Manager for that partner's version, not `latest`;
+    // a partner with no pin still reads `latest`.
+    #[tokio::test]
+    async fn read_fhe_priv_at_reads_the_pinned_version() {
+        let fhe = FhePrivShare {
+            client_key: vec![0x5a; 64],
+            decrypt_signer_priv: vec![0x33; 32],
+        };
+        let payload = fhe.to_canonical_bytes();
+        let shares = shamir::split(&payload, 2, 2, &mut shamir::new_csprng()).unwrap();
+        let ids = ["p-0".to_string(), "p-1".to_string()];
+        let digests = ids
+            .iter()
+            .zip(&shares)
+            .map(|(id, s)| (id.clone(), sha256(s)))
+            .collect();
+        let server = serve_public_material(sha256(&payload), digests).await;
+        for (id, (share, version)) in ids.iter().zip(shares.iter().zip(["7", "latest"])) {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/v1/projects/{id}/secrets/cofhe-tee-fhe-priv/versions/{version}:access"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "name": format!("projects/1/secrets/cofhe-tee-fhe-priv/versions/{version}"),
+                    "payload": { "data": envelope_b64(share.clone()) }
+                })))
+                .mount(&server)
+                .await;
+        }
+        let refs: Vec<PartnerRef> = ids
+            .iter()
+            .map(|id| PartnerRef {
+                project_id: id.clone(),
+                secret_id: "cofhe-tee-fhe-priv".to_string(),
+                wip_audience: String::new(),
+            })
+            .collect();
+        let sm = SecretManager::new(server.uri());
+        let gcs = GcsClient::new(server.uri());
+        let pin = |id: &str| match id {
+            "p-0" => SecretVersion::Number(std::num::NonZeroU64::new(7).unwrap()),
+            _ => SecretVersion::Latest,
+        };
+        let got = read_fhe_priv_at(&ctx(&sm, &gcs), &same_token(&refs, "tok"), 2, &pin)
+            .await
+            .unwrap();
+        assert_eq!(got, fhe);
+    }
+
     // Per-partner SM tokens: each partner is wrapped in a PartnerAccess carrying a
     // DISTINCT token, and each partner's mock SM ONLY answers when called with THAT
     // partner's bearer (`.and(header("authorization", "Bearer tok-{i}"))`). If the
@@ -1099,5 +1198,56 @@ mod tests {
             let id = format!("partner-{i}");
             assert!(err.contains(&id), "bad partner {id} missing from: {err}");
         }
+    }
+
+    // After a reshare the manifest lists only the new split. A staying partner that
+    // still serves its old share, a removed partner, and a mix of old and new shares
+    // must never reconstruct: old and new shares lie on different polynomials.
+    #[tokio::test]
+    async fn read_fhe_priv_after_reshare_uses_only_new_shares() {
+        let fhe = FhePrivShare {
+            client_key: vec![0x6c; 80],
+            decrypt_signer_priv: vec![0x44; 32],
+        };
+        let payload = fhe.to_canonical_bytes();
+        let mut rng = shamir::new_csprng();
+        // Old set p-0, p-1, p-2; new set p-1, p-3. Both 2-of-n.
+        let old = shamir::split(&payload, 3, 2, &mut rng).unwrap();
+        let new = shamir::split(&payload, 2, 2, &mut rng).unwrap();
+        let digests = vec![
+            ("p-1".to_string(), sha256(&new[0])),
+            ("p-3".to_string(), sha256(&new[1])),
+        ];
+        let partners = vec![
+            ("p-0".to_string(), Serve::WrongBytes(old[0].clone())), // removed
+            ("p-1".to_string(), Serve::ShareOk(new[0].clone())),
+            ("p-2".to_string(), Serve::WrongBytes(old[2].clone())), // removed
+            ("p-3".to_string(), Serve::ShareOk(new[1].clone())),
+        ];
+        let (server, refs) =
+            serve_fhe_priv_split(sha256(&payload), digests.clone(), &partners).await;
+        let sm = SecretManager::new(server.uri());
+        let gcs = GcsClient::new(server.uri());
+        let got = read_fhe_priv(&ctx(&sm, &gcs), &same_token(&refs, "tok"), 2)
+            .await
+            .unwrap();
+        assert_eq!(got, fhe);
+
+        // p-1 is a staying partner that still serves its OLD share. With p-3 that is
+        // one old and one new share: the reader refuses, and names both bad partners.
+        let partners = vec![
+            ("p-0".to_string(), Serve::WrongBytes(old[0].clone())),
+            ("p-1".to_string(), Serve::WrongBytes(old[1].clone())),
+            ("p-3".to_string(), Serve::ShareOk(new[1].clone())),
+        ];
+        let (server, refs) = serve_fhe_priv_split(sha256(&payload), digests, &partners).await;
+        let sm = SecretManager::new(server.uri());
+        let gcs = GcsClient::new(server.uri());
+        let err = read_fhe_priv(&ctx(&sm, &gcs), &same_token(&refs, "tok"), 2)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unrecoverable"), "got: {err}");
+        assert!(err.contains("p-0") && err.contains("p-1"), "got: {err}");
     }
 }
