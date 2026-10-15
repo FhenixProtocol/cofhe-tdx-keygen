@@ -10,6 +10,7 @@
 
 use anyhow::{bail, Context, Result};
 use cofhe_keys::gcs::GcsClient;
+use cofhe_keys::keygen;
 use cofhe_keys::reader::{
     lookup, partner_refs, read_fhe_priv, read_zk_signer, PartnerAccess, PartnerRef, ReaderContext,
 };
@@ -191,6 +192,7 @@ struct ReconArgs {
     public_object: Option<String>,
     secret_fhe_priv: String,
     secret_zk_signer: String,
+    check_keys: bool,
 }
 
 fn recon_usage() -> ! {
@@ -199,13 +201,15 @@ fn recon_usage() -> ! {
          --token <access_token> \\\n  \
          [--bucket <name>] [--public-object <name>] \\\n  \
          [--secret-fhe-priv <s>] [--secret-zk-signer <s>] \\\n  \
-         [--sm-url <url>] [--gcs-url <url>]\n\n\
+         [--sm-url <url>] [--gcs-url <url>] [--check-keys]\n\n\
          The partner set AND the public-material bucket/object are BAKED per\n\
          environment — --env selects them and fails closed on anything\n\
          else. --bucket / --public-object are optional OVERRIDES for testing against\n\
          an ad-hoc location; omitted, they default to the baked env source. Fetches\n\
          each partner's share, reconstructs both secrets from T good shares, and\n\
-         validates them against the published full digests."
+         validates them against the published full digests. --check-keys also\n\
+         proves the rebuilt key is the key behind the published public keys and\n\
+         signers (the check a reshare runs before it writes)."
     );
     std::process::exit(2);
 }
@@ -220,9 +224,15 @@ fn parse_reconstruct_args(argv: &[String]) -> Result<ReconArgs> {
     let mut public_object = None;
     let mut secret_fhe_priv = "cofhe-tee-fhe-priv".to_string();
     let mut secret_zk_signer = "cofhe-tee-zk-signer".to_string();
+    let mut check_keys = false;
 
     let mut i = 2; // skip argv[0] and the "reconstruct" subcommand
     while i < argv.len() {
+        if argv[i] == "--check-keys" {
+            check_keys = true;
+            i += 1;
+            continue;
+        }
         match argv[i].as_str() {
             "--env" => env = Some(req_val(argv, i)?),
             "--threshold" => threshold = Some(req_val(argv, i)?.parse().context("--threshold")?),
@@ -249,6 +259,7 @@ fn parse_reconstruct_args(argv: &[String]) -> Result<ReconArgs> {
         public_object,
         secret_fhe_priv,
         secret_zk_signer,
+        check_keys,
     })
 }
 
@@ -323,14 +334,21 @@ async fn reconstruct_main(argv: &[String]) -> Result<()> {
         .context("download public-material manifest")?;
     let public = serialization::PublicMaterial::from_canonical_bytes(&manifest)
         .context("decode public-material manifest")?;
-    for (name, digest, label) in [
-        ("computation_key", &public.server_key_digest, "server_key"),
+    let mut artifacts = keygen::PublicArtifacts::default();
+    for (slot, name, digest, label) in [
         (
+            &mut artifacts.server_key,
+            "computation_key",
+            &public.server_key_digest,
+            "server_key",
+        ),
+        (
+            &mut artifacts.compact_public_key,
             "public_key",
             &public.compact_public_key_digest,
             "compact_public_key",
         ),
-        ("crs", &public.crs_digest, "crs"),
+        (&mut artifacts.crs, "crs", &public.crs_digest, "crs"),
     ] {
         let obj = sibling_object(public_object, name);
         let bytes = gcs
@@ -343,9 +361,46 @@ async fn reconstruct_main(argv: &[String]) -> Result<()> {
             "OK  {label} artifact ({obj}) matches its manifest digest ({} B)",
             bytes.len()
         );
+        *slot = bytes;
+    }
+
+    if a.check_keys {
+        keygen::verify_against_public(&fhe, &zk, &public, &artifacts)
+            .context("check the rebuilt key against the published keys")?;
+        println!("OK  the rebuilt key matches the published public keys and signers");
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod reconstruct_args_tests {
+    use super::parse_reconstruct_args;
+
+    fn argv(extra: &[&str]) -> Vec<String> {
+        [
+            "verify",
+            "reconstruct",
+            "--env",
+            "staging",
+            "--threshold",
+            "2",
+            "--token",
+            "t",
+        ]
+        .iter()
+        .chain(extra)
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    #[test]
+    fn check_keys_is_a_flag_without_a_value() {
+        assert!(!parse_reconstruct_args(&argv(&[])).unwrap().check_keys);
+        let a = parse_reconstruct_args(&argv(&["--check-keys", "--bucket", "b"])).unwrap();
+        assert!(a.check_keys);
+        assert_eq!(a.bucket.as_deref(), Some("b"));
+    }
 }
 
 #[cfg(test)]

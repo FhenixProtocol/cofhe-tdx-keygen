@@ -28,6 +28,10 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The mock build carries a synthetic reshare that no other step compiles.
+      - name: clippy (mock)
+        run: cargo clippy -p keygen --features mock --all-targets -- -D warnings
+
       - name: build
         run: cargo build --workspace --release
 
