@@ -8,6 +8,9 @@
 //! keep working for read-side consumers unchanged.
 
 use anyhow::{anyhow, Result};
+use std::num::NonZeroU64;
+
+use crate::secrets::SecretVersion;
 
 /// The reader's key SOURCE is baked at compile time — never operator-settable.
 /// One entry per blessed env. Onboarding an env, and changing a partner SET within
@@ -47,6 +50,58 @@ pub struct EnvConfig {
     /// Shamir reconstruction threshold (T). Baked once here so the producer's split
     /// and every consumer's reconstruct agree on T (N is the partner count).
     pub shamir_threshold: u8,
+    /// The partner set that holds the live shares, when the next keygen run is a
+    /// reshare. `partners` and `shamir_threshold` above are then the target set.
+    /// Consumers read no shares from this set, but their placeholder gate still
+    /// checks it (`ensure_partners_complete`). The keygen image built from an env
+    /// with this field can only reshare; without it, only a ceremony. Remove it once
+    /// the reshare is done.
+    pub reshare_from: Option<ReshareSource>,
+    /// Set this only for a deliberate new keyset (a key rotation). It has no
+    /// meaning for a reshare.
+    pub replace_live_keyset: bool,
+}
+
+/// The source of a reshare: the partner set that holds the live shares, the
+/// threshold those shares were split with, and an anchor on the live keyset.
+///
+/// The anchor is the two signer addresses of the live keyset. They are public and
+/// on-chain. The reshare refuses a manifest whose addresses differ, so a bucket
+/// writer cannot swap in an older keyset's manifest, and with it an older key, for
+/// the run to split again.
+pub struct ReshareSource {
+    pub partners: &'static [EnvPartner],
+    pub shamir_threshold: u8,
+    pub decrypt_signer_address: &'static str,
+    pub zk_signer_address: &'static str,
+    /// Recovery only, normally empty. After a reshare stops mid-write, `latest` at a
+    /// written source partner holds a share that no manifest lists. A pin names the
+    /// version the failed run logged for one partner's secret. A secret that no pin
+    /// names is read at `latest`.
+    pub pins: &'static [SourcePin],
+}
+
+/// The Secret Manager versions to read at one source partner. Each secret numbers
+/// its versions on its own, so each has its own pin; `None` reads `latest`.
+pub struct SourcePin {
+    pub project_id: &'static str,
+    pub fhe_priv: Option<NonZeroU64>,
+    pub zk_signer: Option<NonZeroU64>,
+}
+
+impl ReshareSource {
+    /// The version to read for one source partner's secret: its pin, or `latest`.
+    pub fn version_of(
+        &self,
+        project_id: &str,
+        pick: fn(&SourcePin) -> Option<NonZeroU64>,
+    ) -> SecretVersion {
+        self.pins
+            .iter()
+            .find(|p| p.project_id == project_id)
+            .and_then(pick)
+            .map_or(SecretVersion::Latest, SecretVersion::Number)
+    }
 }
 
 const STAGING: EnvConfig = EnvConfig {
@@ -82,6 +137,8 @@ const STAGING: EnvConfig = EnvConfig {
     public_prefix: "generator/keys/versionized",
     public_zone: 0,
     shamir_threshold: 2,
+    reshare_from: None,
+    replace_live_keyset: false,
 };
 
 const TESTNET: EnvConfig = EnvConfig {
@@ -107,6 +164,8 @@ const TESTNET: EnvConfig = EnvConfig {
     public_prefix: "generator/keys/versionized",
     public_zone: 0,
     shamir_threshold: 2,
+    reshare_from: None,
+    replace_live_keyset: false,
 };
 
 /// The mainnet partner set: six key-share holders, threshold 3. Each runs the partner
@@ -122,11 +181,13 @@ const TESTNET: EnvConfig = EnvConfig {
 /// A project name is chosen by its operator and identifies no one — do not read
 /// ownership, or a guarantee of third-party independence, off these strings.
 ///
-/// Changing the partner set is NOT a config change. It is: edit the entries below,
-/// rebuild every consumer (the source is compile-time), re-pin the new consumer
-/// digests in the env's `keygen-partners` var-file, and have all six partners
-/// re-apply the partner stack. Plan for that sequence — there is no shortcut that
-/// skips the rebuild.
+/// Changing the partner set is NOT a config change. It is: put the current set in
+/// `reshare_from`, edit the entries below to the new set, rebuild every consumer
+/// (the source is compile-time), re-pin the new consumer digests in the env's
+/// `keygen-partners` var-file, have the partners re-apply the partner stack, and
+/// run a reshare. Deploy the rebuilt consumers only after the reshare writes the
+/// new shares: they read the new set only. Then remove `reshare_from`. Plan for
+/// that sequence — there is no shortcut that skips the rebuild.
 const MAINNET: EnvConfig = EnvConfig {
     partners: &[
         EnvPartner {
@@ -170,6 +231,8 @@ const MAINNET: EnvConfig = EnvConfig {
     public_prefix: "generator/keys/versionized",
     public_zone: 0,
     shamir_threshold: 3,
+    reshare_from: None,
+    replace_live_keyset: false,
 };
 
 /// Marks a partner slot that is declared but not yet filled in. A slot keeps the
@@ -186,9 +249,11 @@ impl EnvConfig {
     /// paths that actually touch the partner set: the ceremony's config build and the
     /// reader's reconstruct. Both call this.
     pub fn ensure_partners_complete(&self) -> Result<()> {
+        let sources = self.reshare_from.iter().flat_map(|r| r.partners.iter());
         let pending: Vec<&str> = self
             .partners
             .iter()
+            .chain(sources)
             .filter(|p| {
                 p.project_id.starts_with(PARTNER_PLACEHOLDER)
                     || p.wip_pool_audience.contains(PARTNER_PLACEHOLDER)
@@ -342,6 +407,8 @@ mod tests {
             public_prefix: "p",
             public_zone: 0,
             shamir_threshold: 2,
+            reshare_from: None,
+            replace_live_keyset: false,
         }
     }
 
@@ -373,6 +440,38 @@ mod tests {
             .into_boxed_slice(),
         );
         assert!(env_with(ps).ensure_partners_complete().is_err());
+    }
+
+    // A reshare reads from the source set, so an open slot there must fail too.
+    #[test]
+    fn an_open_slot_in_the_reshare_source_fails_the_gate() {
+        let target: &'static [EnvPartner] = Box::leak(
+            vec![
+                partner("real-1", "111111111111"),
+                partner("real-2", "222222222222"),
+            ]
+            .into_boxed_slice(),
+        );
+        let source: &'static [EnvPartner] = Box::leak(
+            vec![
+                partner("real-1", "111111111111"),
+                partner("FILL-ME-PARTNER-3", "333333333333"),
+            ]
+            .into_boxed_slice(),
+        );
+        let mut env = env_with(target);
+        env.reshare_from = Some(ReshareSource {
+            partners: source,
+            shamir_threshold: 2,
+            decrypt_signer_address: "0x1111111111111111111111111111111111111111",
+            zk_signer_address: "0x2222222222222222222222222222222222222222",
+            pins: &[],
+        });
+        let err = env
+            .ensure_partners_complete()
+            .expect_err("an open source slot must fail closed")
+            .to_string();
+        assert!(err.contains("FILL-ME-PARTNER-3"), "{err}");
     }
 
     #[test]
