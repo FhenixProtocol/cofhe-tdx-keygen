@@ -43,8 +43,8 @@ use crate::shamir;
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 // The baked environment source (`EnvPartner`, `EnvConfig`, `env_names`, `lookup`)
-// lives in the unconditional `crate::envs` module so the write-only enclave image
-// can resolve its env without the reader stack. Re-exported here so existing
+// lives in the unconditional `crate::envs` module so every feature set resolves
+// its env. Re-exported here so existing
 // `cofhe_keys::reader::{…}` consumer paths are unchanged.
 pub use crate::envs::{env_names, lookup, EnvConfig, EnvPartner};
 

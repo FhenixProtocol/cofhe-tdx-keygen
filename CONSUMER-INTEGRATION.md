@@ -185,5 +185,10 @@ that fails crashes the run, so no half-finished ceremony is ever advertised. The
 is fault-tolerant: a hung, stale or lying partner is excluded and logged, and
 reconstruction proceeds from any T good shares.
 
+**A reshare changes the partner set, not the key.** After a reshare, rebuild with the
+new `cofhe-keys` so the baked set is the new target set. The key, the signers and the
+public artifacts stay the same. A share from a removed partner, or an old version at a
+staying partner, fails its per-share digest and is excluded.
+
 **Live key rotation is future work.** Today a re-run appends a fresh keyset as a new
 version across all partners.

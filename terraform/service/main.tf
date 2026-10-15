@@ -193,20 +193,28 @@ resource "google_compute_instance" "keygen_vm" {
   }
 
   # Env vars:
-  #   COFHE_ENV — baked-environment selector. The ceremony resolves the partner set +
-  #         write audiences, N/T, the public bucket, and the layout from its
-  #         compiled-in map (cofhe_keys::reader) keyed by this. Nothing else is
-  #         passed: those values are baked into the image, NOT operator-settable.
-  # COFHE_ENV is the only tee-env-* here and must appear in the Dockerfile's
-  # allow_env_override LABEL (alongside RUST_LOG) or the launcher rejects it.
+  #   COFHE_ENV — baked-environment selector. The run resolves the partner sets +
+  #         audiences, N/T, the public bucket, and the layout from its compiled-in
+  #         map (cofhe_keys::envs) keyed by this.
+  #   KEYGEN_MODE — ceremony or reshare. It must agree with the baked env.
+  #   RESHARE_SOURCE_VERSIONS — set only when pinned: id/secret=N,….
+  # Each tee-env-* here must appear in the Dockerfile's allow_env_override LABEL
+  # or the launcher rejects it. Partner sets and audiences are baked into the
+  # image, NOT operator-settable.
   # Direct federated grant: no SA_EMAIL — the attested federated principal holds the
   # write role directly, so the federated token is used as the SM bearer as-is.
-  metadata = {
-    "tee-image-reference"        = var.image_reference
-    "tee-restart-policy"         = "Never"
-    "tee-container-log-redirect" = "true"
-    "tee-env-COFHE_ENV"          = var.env
-  }
+  metadata = merge(
+    {
+      "tee-image-reference"        = var.image_reference
+      "tee-restart-policy"         = "Never"
+      "tee-container-log-redirect" = "true"
+      "tee-env-COFHE_ENV"          = var.env
+      "tee-env-KEYGEN_MODE"        = var.keygen_mode
+    },
+    length(var.reshare_source_versions) == 0 ? {} : {
+      "tee-env-RESHARE_SOURCE_VERSIONS" = join(",", [for id, v in var.reshare_source_versions : "${id}=${v}"])
+    },
+  )
 
   depends_on = [
     google_project_iam_member.log_writer,

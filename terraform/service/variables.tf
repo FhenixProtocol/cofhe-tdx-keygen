@@ -33,11 +33,46 @@ variable "run_ceremony" {
   type    = bool
   default = false
   # Gates the one-shot keygen VM. Default false: a routine apply of the standing
-  # infra (IAM + the public-bucket write grant) leaves the VM absent and never
-  # regenerates the keyset. Set true ONLY to deliberately run a ceremony (which
-  # generates a NEW keyset and overwrites the partner shares + public material),
-  # then set back to false to tear the VM down. See CEREMONY.md Step 4.
-  description = "When true, create the one-shot TDX keygen VM and run a ceremony. Keep false for routine infra applies."
+  # infra (IAM + the public-bucket write grant) leaves the VM absent. Set true ONLY
+  # to run once in keygen_mode (a ceremony writes a NEW keyset; a reshare splits
+  # the live one again), then set back to false to tear the VM down. A rerun needs
+  # false then true again: the VM runs its container only once. See CEREMONY.md.
+  description = "When true, create the one-shot TDX keygen VM and run it in keygen_mode. Keep false for routine infra applies."
+}
+
+variable "keygen_mode" {
+  type    = string
+  default = "ceremony"
+  # A mismatch with the baked env stops the VM at boot, before any read or write.
+  description = "What the keygen VM runs: ceremony (a new keyset) or reshare (the live keyset, split again for the baked target set). Passed as KEYGEN_MODE."
+  validation {
+    condition     = contains(["ceremony", "reshare"], var.keygen_mode)
+    error_message = "keygen_mode must be ceremony or reshare."
+  }
+}
+
+variable "reshare_source_versions" {
+  type    = map(number)
+  default = {}
+  # Recovery only. After a reshare stops mid-write, latest at a staying partner
+  # holds a share that no manifest describes. Pin each such secret to the number
+  # at the end of the `version` field of the failed run's "read share" log line
+  # (projects/…/versions/N). The two secrets number their
+  # versions apart, so each key names one secret. Every pinned share must still
+  # match the live manifest, so a wrong value only stops the run.
+  description = "Reshare only: \"<source partner project id>/<fhe-priv|zk-signer>\" -> Secret Manager version to read instead of latest. Passed as RESHARE_SOURCE_VERSIONS."
+  validation {
+    condition     = alltrue([for v in values(var.reshare_source_versions) : v >= 1 && floor(v) == v])
+    error_message = "each reshare source version must be a whole number >= 1."
+  }
+  validation {
+    condition     = alltrue([for k in keys(var.reshare_source_versions) : can(regex("^[a-z0-9-]+/(fhe-priv|zk-signer)$", k))])
+    error_message = "each key must be \"<partner project id>/fhe-priv\" or \"<partner project id>/zk-signer\"."
+  }
+  validation {
+    condition     = length(var.reshare_source_versions) == 0 || var.keygen_mode == "reshare"
+    error_message = "reshare_source_versions applies only with keygen_mode = reshare."
+  }
 }
 
 variable "public_material_anonymous_read" {
