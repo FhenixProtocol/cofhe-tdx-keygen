@@ -64,11 +64,42 @@ impl GcsClient {
         object_name: &str,
         data: &[u8],
     ) -> Result<String> {
+        self.upload_with(access_token, bucket, object_name, data, None)
+            .await
+    }
+
+    /// [`upload`](Self::upload) only if the live object is still at `generation`
+    /// (GCS `ifGenerationMatch`). Fails when another writer replaced it since the
+    /// caller read it.
+    pub async fn upload_if_generation(
+        &self,
+        access_token: &str,
+        bucket: &str,
+        object_name: &str,
+        data: &[u8],
+        generation: u64,
+    ) -> Result<String> {
+        self.upload_with(access_token, bucket, object_name, data, Some(generation))
+            .await
+    }
+
+    async fn upload_with(
+        &self,
+        access_token: &str,
+        bucket: &str,
+        object_name: &str,
+        data: &[u8],
+        if_generation: Option<u64>,
+    ) -> Result<String> {
         let url = format!("{}/upload/storage/v1/b/{}/o", self.base_url, bucket);
-        let resp = self
+        let mut req = self
             .http
             .post(&url)
-            .query(&[("uploadType", "media"), ("name", object_name)])
+            .query(&[("uploadType", "media"), ("name", object_name)]);
+        if let Some(g) = if_generation {
+            req = req.query(&[("ifGenerationMatch", g)]);
+        }
+        let resp = req
             .bearer_auth(access_token)
             .header("content-type", "application/octet-stream")
             .body(data.to_vec())
@@ -95,6 +126,38 @@ impl GcsClient {
         bucket: &str,
         object_name: &str,
     ) -> Result<Vec<u8>> {
+        Ok(self
+            .download_with(access_token, bucket, object_name)
+            .await?
+            .0)
+    }
+
+    /// [`download`](Self::download), plus the object generation that GCS served, for
+    /// a later [`upload_if_generation`](Self::upload_if_generation).
+    pub async fn download_generation(
+        &self,
+        access_token: &str,
+        bucket: &str,
+        object_name: &str,
+    ) -> Result<(Vec<u8>, u64)> {
+        let (bytes, generation) = self
+            .download_with(access_token, bucket, object_name)
+            .await?;
+        let generation = generation
+            .context("GCS download response has no x-goog-generation header")?
+            .to_str()
+            .context("x-goog-generation is not text")?
+            .parse()
+            .context("x-goog-generation is not a number")?;
+        Ok((bytes, generation))
+    }
+
+    async fn download_with(
+        &self,
+        access_token: &str,
+        bucket: &str,
+        object_name: &str,
+    ) -> Result<(Vec<u8>, Option<reqwest::header::HeaderValue>)> {
         let url = format!(
             "{}/storage/v1/b/{}/o/{}",
             self.base_url,
@@ -114,6 +177,7 @@ impl GcsClient {
             let text = resp.text().await.unwrap_or_default();
             anyhow::bail!("GCS download {} — {}", status, text);
         }
+        let generation = resp.headers().get("x-goog-generation").cloned();
         if let Some(len) = resp.content_length() {
             if len > MAX_DOWNLOAD_BYTES {
                 bail!(
@@ -131,7 +195,7 @@ impl GcsClient {
                 MAX_DOWNLOAD_BYTES
             );
         }
-        Ok(bytes.to_vec())
+        Ok((bytes.to_vec(), generation))
     }
 }
 
@@ -174,6 +238,50 @@ mod tests {
             .await;
         let gcs = GcsClient::new(server.uri());
         assert!(gcs.upload("t", "b", "o", b"x").await.is_err());
+    }
+
+    // The manifest compare-and-swap: the generation comes back from the download,
+    // and an upload pinned to a generation that moved on fails.
+    #[tokio::test]
+    async fn download_generation_then_conditional_upload() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/storage/v1/b/b/o/m"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-goog-generation", "42")
+                    .set_body_bytes(b"M".to_vec()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/upload/storage/v1/b/b/o"))
+            .and(query_param("ifGenerationMatch", "42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "m", "generation": "43"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/upload/storage/v1/b/b/o"))
+            .and(query_param("ifGenerationMatch", "41"))
+            .respond_with(ResponseTemplate::new(412).set_body_string("conditionNotMet"))
+            .mount(&server)
+            .await;
+
+        let gcs = GcsClient::new(server.uri());
+        let (bytes, generation) = gcs.download_generation("t", "b", "m").await.unwrap();
+        assert_eq!((bytes.as_slice(), generation), (&b"M"[..], 42));
+        assert_eq!(
+            gcs.upload_if_generation("t", "b", "m", b"N", 42)
+                .await
+                .unwrap(),
+            "m#43"
+        );
+        assert!(gcs
+            .upload_if_generation("t", "b", "m", b"N", 41)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
