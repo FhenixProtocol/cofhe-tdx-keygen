@@ -30,10 +30,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM gcr.io/distroless/cc-debian12@sha256:d703b626ba455c4e6c6fbe5f36e6f427c85d51445598d564652a2f334179f96e
 COPY --from=build /keygen /keygen
-# Only the baked-environment selector (ENV) and log level (RUST_LOG) may be
-# overridden by an operator. The partner set + write audiences, N/T, the secret
-# ids, and the public bucket + layout are compiled in per-env (see cofhe_keys::reader)
-# and are NOT in this allowlist, so a VM metadata override cannot change them.
-LABEL "tee.launch_policy.allow_env_override"="COFHE_ENV,RUST_LOG"
+# An operator may override only these: the baked-environment selector (COFHE_ENV),
+# the run mode (KEYGEN_MODE, which must agree with the baked env), the source
+# versions of a reshare (RESHARE_SOURCE_VERSIONS, checked against the published
+# digests), and the log level (RUST_LOG). The partner sets + audiences, N/T, the
+# secret ids, and the public bucket + layout are compiled in per-env (see
+# cofhe_keys::envs) and are NOT in this allowlist, so a VM metadata override cannot
+# change them.
+LABEL "tee.launch_policy.allow_env_override"="COFHE_ENV,KEYGEN_MODE,RESHARE_SOURCE_VERSIONS,RUST_LOG"
 LABEL "tee.launch_policy.log_redirect"="always"
 ENTRYPOINT ["/keygen"]
