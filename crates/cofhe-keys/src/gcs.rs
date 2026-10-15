@@ -84,6 +84,38 @@ impl GcsClient {
         Ok(format!("{}#{}", parsed.name, parsed.generation))
     }
 
+    /// Whether an object exists, from a listing of its name. A missing bucket is an
+    /// error, not an absent object: a metadata read gives 404 for both, and a typo in
+    /// a bucket name must never pass for "no live keyset".
+    pub async fn exists(
+        &self,
+        access_token: &str,
+        bucket: &str,
+        object_name: &str,
+    ) -> Result<bool> {
+        #[derive(Deserialize)]
+        struct Listing {
+            #[serde(default)]
+            items: Vec<ObjectResponse>,
+        }
+        let url = format!("{}/storage/v1/b/{}/o", self.base_url, bucket);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("prefix", object_name), ("fields", "items(name)")])
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .context("GCS list request failed")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            bail!("GCS list {} — {}", status, text);
+        }
+        let listing: Listing = resp.json().await.context("parse GCS listing")?;
+        Ok(listing.items.iter().any(|o| o.name == object_name))
+    }
+
     /// Download an object's bytes (latest live generation) via the GCS JSON API
     /// media download. Used by the consumer reader to fetch the public material.
     /// `object_name` is percent-encoded into the single path segment, so names
@@ -174,6 +206,42 @@ mod tests {
             .await;
         let gcs = GcsClient::new(server.uri());
         assert!(gcs.upload("t", "b", "o", b"x").await.is_err());
+    }
+
+    // The ceremony's replace guard: a listing with the exact name is a live object;
+    // a listing without it (a prefix match only) is none; a missing bucket (404) or
+    // any other failure stops the run instead of passing for "absent".
+    #[tokio::test]
+    async fn exists_lists_by_exact_name_and_fails_closed() {
+        let server = MockServer::start().await;
+        for (bucket, status, items) in [
+            (
+                "live",
+                200,
+                serde_json::json!({"items": [{"name": "m"}, {"name": "m.prev.x"}]}),
+            ),
+            (
+                "only-prev",
+                200,
+                serde_json::json!({"items": [{"name": "m.prev.x"}]}),
+            ),
+            ("empty", 200, serde_json::json!({})),
+            ("missing", 404, serde_json::json!({})),
+            ("denied", 403, serde_json::json!({})),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/storage/v1/b/{bucket}/o")))
+                .and(query_param("prefix", "m"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(items))
+                .mount(&server)
+                .await;
+        }
+        let gcs = GcsClient::new(server.uri());
+        assert!(gcs.exists("t", "live", "m").await.unwrap());
+        assert!(!gcs.exists("t", "only-prev", "m").await.unwrap());
+        assert!(!gcs.exists("t", "empty", "m").await.unwrap());
+        assert!(gcs.exists("t", "missing", "m").await.is_err());
+        assert!(gcs.exists("t", "denied", "m").await.is_err());
     }
 
     #[tokio::test]
