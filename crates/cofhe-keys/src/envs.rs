@@ -1,9 +1,8 @@
 //! Baked environment source — the compile-time key SOURCE shared by BOTH sides of
 //! the crate: the producer keygen (write side, `writer` feature) and the consumer
 //! reader (read side, `reader` feature). It is deliberately UNCONDITIONAL (no
-//! feature gate) so the write-only enclave image — built `--no-default-features`
-//! with just `writer` — can still resolve its env via [`lookup`] without pulling in
-//! the reader's async fetch stack. The `reader` module re-exports these items, so
+//! feature gate) so every feature set resolves its env via [`lookup`]. The `reader`
+//! module re-exports these items, so
 //! existing `cofhe_keys::reader::{lookup, env_names, EnvConfig, EnvPartner}` paths
 //! keep working for read-side consumers unchanged.
 

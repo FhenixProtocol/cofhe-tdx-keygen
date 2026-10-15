@@ -31,13 +31,10 @@ jobs:
       - name: build
         run: cargo build --workspace --release
 
-      # The enclave image builds the keygen binary with cofhe-keys `writer` only
-      # (reader stripped) — a profile the workspace build above never exercises.
-      # This runs the exact Dockerfile command so a writer-only feature
-      # hole fails CI here, not at image-build/ceremony time (regression guard for
-      # the break fixed by moving the baked env source into the unconditional
-      # `cofhe_keys::envs` module).
-      - name: build (writer-only image profile)
+      # The image builds keygen with `--no-default-features`, a profile the
+      # workspace build above never exercises. This runs the exact Dockerfile
+      # command, so a feature hole fails CI here, not at image-build or run time.
+      - name: build (image profile)
         run: cargo build --locked --bin keygen --no-default-features
 
       - name: test
