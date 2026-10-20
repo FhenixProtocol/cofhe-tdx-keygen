@@ -236,11 +236,10 @@ They cannot drift, because they are the same code.
 `read_fhe_priv` and `read_zk_signer` do the whole job: they gather every partner's share
 fault-tolerantly (`fetch_all`, with a per-partner timeout), then call
 `reconstruct_and_validate` (per-share digest filter → reconstruct from T → full-key
-digest check). `read_share` is the single-secret unit, and `read_public` downloads and
-checks the public material. The reader is auth-agnostic: the caller passes tokens it
-obtained with its own identity, so the library carries no attestation or write
-machinery. The `verify reconstruct` CLI is a thin wrapper over these entry points, for
-operator round-trips.
+digest check). `read_public` downloads and checks the public material. The reader is
+auth-agnostic: the caller passes tokens it obtained with its own identity, so the
+library carries no attestation or write machinery. The `verify reconstruct` CLI is a
+thin wrapper over these entry points, for operator round-trips.
 
 We write **two per-audience secrets** per partner, so that IAM enforces least privilege:
 `cofhe-tee-fhe-priv` (FHE priv + decrypt signer → TeeCryptor) and `cofhe-tee-zk-signer`

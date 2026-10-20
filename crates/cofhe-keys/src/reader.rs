@@ -20,9 +20,8 @@
 //! the published per-share digests, and reconstructs from any T good shares. The
 //! gather is fault-tolerant — a partner whose fetch fails is excluded by project
 //! id (logged, non-fatal), never aborting the batch, so a single bad/absent
-//! partner can be overcome while ≥ T good shares remain. [`read_shares`] is the
-//! strict (abort-on-first) gather kept as a primitive; [`read_fhe_priv`] /
-//! [`read_zk_signer`] route through the fault-tolerant path.
+//! partner can be overcome while ≥ T good shares remain. [`read_fhe_priv`] /
+//! [`read_zk_signer`] use this gather.
 
 use anyhow::{anyhow, bail, Context, Result};
 use zeroize::Zeroize;
@@ -31,7 +30,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use crate::gcs::GcsClient;
-use crate::secrets::SecretManager;
+use crate::secrets::{SecretManager, SecretVersion};
 use crate::serialization::{self, FhePrivShare, PublicMaterial, SecretEnvelope, ZkSignerShare};
 use crate::shamir;
 
@@ -90,51 +89,28 @@ pub struct PartnerAccess<'a> {
     pub sm_token: &'a str,
 }
 
-/// Read one partner's secret envelope and return its **payload bytes** (one
-/// audience component's canonical bytes). Share authenticity rests on the
-/// partner's attested-WIF write-gate (only the attested enclave can write the
-/// secret version); the caller then filters liars and validates the reconstructed
-/// secret against the published digests.
-///
-/// CONSUMER CONTRACT: decode the returned payload with the matching
-/// `cofhe_keys::serialization` type (`FhePrivShare` / `ZkSignerShare`). When
-/// deserializing the inner tfhe blobs (the FHE-priv secret's `client_key`), use
-/// tfhe's `safe_deserialize` with a bounded size limit (the keygen writes with a
-/// 1 GiB limit) — never the unbounded `deserialize` — so a corrupt blob can't
-/// drive an unbounded allocation in the consumer.
-pub async fn read_share(
+/// Read one partner's secret envelope at one version and return its **payload
+/// bytes** (one audience component's canonical bytes). Logs the version Secret
+/// Manager resolved, so an operator can pin the same shares on a rerun.
+async fn read_share_at(
     sm: &SecretManager,
     sm_token: &str,
     partner: &PartnerRef,
+    version: SecretVersion,
 ) -> Result<Vec<u8>> {
-    let raw = sm
-        .access(sm_token, &partner.project_id, &partner.secret_id)
+    let (name, raw) = sm
+        .access_version(sm_token, &partner.project_id, &partner.secret_id, version)
         .await
         .with_context(|| {
             format!(
-                "read secret {} for partner {}",
+                "read secret {} version {version} for partner {}",
                 partner.secret_id, partner.project_id
             )
         })?;
+    tracing::info!(partner = %partner.project_id, version = %name, "read share");
     let envelope = SecretEnvelope::from_canonical_bytes(raw.as_slice())
-        .with_context(|| format!("decode envelope for partner {}", partner.project_id))?;
+        .with_context(|| format!("decode envelope {name} for partner {}", partner.project_id))?;
     Ok(envelope.payload)
-}
-
-/// Strict gather: read the SAME audience secret from EACH partner and return the
-/// per-partner payloads in order. Any partner failing aborts the whole read. This
-/// is the abort-on-first primitive; the Shamir entry points use the fault-tolerant
-/// [`fetch_all`] gather instead, which tolerates per-partner failure so a single
-/// bad partner can be overcome.
-pub async fn read_shares(
-    sm: &SecretManager,
-    partners: &[PartnerAccess<'_>],
-) -> Result<Vec<Vec<u8>>> {
-    let mut payloads = Vec::with_capacity(partners.len());
-    for a in partners {
-        payloads.push(read_share(sm, a.sm_token, a.partner).await?);
-    }
-    Ok(payloads)
 }
 
 /// Read the public material from our bucket and return its bytes. Integrity rests
@@ -159,21 +135,25 @@ pub async fn read_public(
 /// and `failed` is the excluded partner ids.
 ///
 /// Uses [`futures::future::join_all`] (NOT `try_join_all`, which fails fast) so all
-/// results come back before partitioning. [`read_share`] remains the per-partner
+/// results come back before partitioning. [`read_share_at`] is the per-partner
 /// unit; bad/stale share bytes are caught downstream by the per-share digest filter.
 async fn fetch_all(
     sm: &SecretManager,
     partners: &[PartnerAccess<'_>],
+    version_of: &dyn Fn(&str) -> SecretVersion,
 ) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
     let results = futures::future::join_all(partners.iter().map(|a| async move {
         // Per-partner timeout: a hung partner must not stall the whole gather. On
         // timeout it's treated as a failure -> excluded, and we reconstruct from the
         // other T good shares (join_all still waits for the rest, capped at this).
-        let r =
-            match tokio::time::timeout(READ_TIMEOUT, read_share(sm, a.sm_token, a.partner)).await {
-                Ok(res) => res,
-                Err(_) => Err(anyhow!("partner fetch timed out after {READ_TIMEOUT:?}")),
-            };
+        let version = version_of(&a.partner.project_id);
+        let read = read_share_at(sm, a.sm_token, a.partner, version);
+        let r = match tokio::time::timeout(READ_TIMEOUT, read).await {
+            Ok(res) => res,
+            Err(_) => Err(anyhow!(
+                "partner fetch at version {version} timed out after {READ_TIMEOUT:?}"
+            )),
+        };
         (a.partner.project_id.clone(), r)
     }))
     .await;
@@ -299,6 +279,7 @@ async fn read_reconstruct_validate(
     select_share_digests: impl Fn(&PublicMaterial) -> Vec<(String, [u8; 32])>,
     select_full_digest: impl Fn(&PublicMaterial) -> [u8; 32],
     label: &str,
+    version_of: &dyn Fn(&str) -> SecretVersion,
 ) -> Result<Vec<u8>> {
     // Fail-closed on an unfilled partner slot. Without this the tolerant gather would
     // simply drop the placeholder partners and reconstruct from whatever real ones
@@ -327,7 +308,7 @@ async fn read_reconstruct_validate(
     let public =
         PublicMaterial::from_canonical_bytes(&public_bytes).context("decode public material")?;
 
-    let (mut successes, fetch_failed) = fetch_all(ctx.sm, partners).await;
+    let (mut successes, fetch_failed) = fetch_all(ctx.sm, partners, version_of).await;
 
     let share_digests = select_share_digests(&public);
     let full_digest = select_full_digest(&public);
@@ -369,10 +350,25 @@ async fn read_reconstruct_validate(
 /// validate it against the published digest, and return the typed component (the
 /// caller feeds `client_key` to its `KeyStore` and `decrypt_signer_priv` to its
 /// signer). See `CONSUMER-INTEGRATION.md`.
+///
+/// CONSUMER CONTRACT: decode `client_key` with tfhe's `safe_deserialize` and a size
+/// limit (the keygen writes with a 1 GiB limit), never the unbounded `deserialize`,
+/// so a corrupt blob cannot cause an unbounded allocation.
 pub async fn read_fhe_priv(
     ctx: &ReaderContext<'_>,
     partners: &[PartnerAccess<'_>],
     threshold: u8,
+) -> Result<FhePrivShare> {
+    read_fhe_priv_at(ctx, partners, threshold, &|_| SecretVersion::Latest).await
+}
+
+/// [`read_fhe_priv`] at a chosen version per partner (keyed by project id). The
+/// keygen reshare uses it to rerun on the same shares after a stop mid-write.
+pub async fn read_fhe_priv_at(
+    ctx: &ReaderContext<'_>,
+    partners: &[PartnerAccess<'_>],
+    threshold: u8,
+    version_of: &dyn Fn(&str) -> SecretVersion,
 ) -> Result<FhePrivShare> {
     let payload = read_reconstruct_validate(
         ctx,
@@ -381,6 +377,7 @@ pub async fn read_fhe_priv(
         |p| p.fhe_priv_share_digests.clone(),
         |p| p.fhe_priv_digest,
         "fhe-priv",
+        version_of,
     )
     .await?;
     FhePrivShare::from_canonical_bytes(&payload).context("decode FhePrivShare")
@@ -393,6 +390,16 @@ pub async fn read_zk_signer(
     partners: &[PartnerAccess<'_>],
     threshold: u8,
 ) -> Result<ZkSignerShare> {
+    read_zk_signer_at(ctx, partners, threshold, &|_| SecretVersion::Latest).await
+}
+
+/// [`read_zk_signer`] at a chosen version per partner (keyed by project id).
+pub async fn read_zk_signer_at(
+    ctx: &ReaderContext<'_>,
+    partners: &[PartnerAccess<'_>],
+    threshold: u8,
+    version_of: &dyn Fn(&str) -> SecretVersion,
+) -> Result<ZkSignerShare> {
     let payload = read_reconstruct_validate(
         ctx,
         partners,
@@ -400,6 +407,7 @@ pub async fn read_zk_signer(
         |p| p.zk_signer_share_digests.clone(),
         |p| p.zk_signer_digest,
         "zk-signer",
+        version_of,
     )
     .await?;
     ZkSignerShare::from_canonical_bytes(&payload).context("decode ZkSignerShare")
@@ -408,7 +416,7 @@ pub async fn read_zk_signer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::serialization::{sha256, FhePrivShare, PublicMaterial, ZkSignerShare};
+    use crate::serialization::{sha256, FhePrivShare, PublicMaterial};
     use base64::Engine as _;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -504,7 +512,9 @@ mod tests {
             secret_id: "cofhe-tee-fhe-priv".to_string(),
             wip_audience: String::new(),
         };
-        let got = read_share(&sm, "sm-tok", &partner).await.unwrap();
+        let got = read_share_at(&sm, "sm-tok", &partner, SecretVersion::Latest)
+            .await
+            .unwrap();
         assert_eq!(got, payload);
         assert_eq!(FhePrivShare::from_canonical_bytes(&got).unwrap(), fhe);
     }
@@ -523,113 +533,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes, b"PUBLIC");
-    }
-
-    // Multi-partner gather (the Shamir-ready primitive): reads each partner's
-    // secret in order and returns one payload per partner.
-    #[tokio::test]
-    async fn read_shares_gathers_all_partners() {
-        let p1 = FhePrivShare {
-            client_key: vec![1; 64],
-            decrypt_signer_priv: vec![2; 32],
-        }
-        .to_canonical_bytes();
-        let p2 = ZkSignerShare {
-            zk_signer_priv: vec![3; 32],
-        }
-        .to_canonical_bytes();
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path(
-                "/v1/projects/partner-1/secrets/cofhe-tee-fhe-priv/versions/latest:access",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "name": "v",
-                "payload": { "data": envelope_b64(p1.clone()) }
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(
-                "/v1/projects/partner-2/secrets/cofhe-tee-zk-signer/versions/latest:access",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "name": "v",
-                "payload": { "data": envelope_b64(p2.clone()) }
-            })))
-            .mount(&server)
-            .await;
-
-        let sm = SecretManager::new(server.uri());
-        let partners = [
-            PartnerRef {
-                project_id: "partner-1".to_string(),
-                secret_id: "cofhe-tee-fhe-priv".to_string(),
-                wip_audience: String::new(),
-            },
-            PartnerRef {
-                project_id: "partner-2".to_string(),
-                secret_id: "cofhe-tee-zk-signer".to_string(),
-                wip_audience: String::new(),
-            },
-        ];
-        let got = read_shares(&sm, &same_token(&partners, "tok"))
-            .await
-            .unwrap();
-        assert_eq!(got, vec![p1, p2]);
-    }
-
-    // Any single partner failing aborts the whole gather (no partial vec) — the
-    // fail-closed invariant a threshold reconstruction depends on. Here partner-2
-    // returns bytes that aren't a valid envelope.
-    #[tokio::test]
-    async fn read_shares_aborts_if_one_partner_fails() {
-        let good = FhePrivShare {
-            client_key: vec![1; 64],
-            decrypt_signer_priv: vec![2; 32],
-        }
-        .to_canonical_bytes();
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path(
-                "/v1/projects/partner-1/secrets/cofhe-tee-fhe-priv/versions/latest:access",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "name": "v",
-                "payload": { "data": envelope_b64(good.clone()) }
-            })))
-            .mount(&server)
-            .await;
-        // partner-2 returns non-envelope bytes → its read fails → the gather aborts.
-        Mock::given(method("GET"))
-            .and(path(
-                "/v1/projects/partner-2/secrets/cofhe-tee-zk-signer/versions/latest:access",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "name": "v",
-                "payload": { "data": base64::engine::general_purpose::STANDARD.encode(b"not-an-envelope") }
-            })))
-            .mount(&server)
-            .await;
-
-        let sm = SecretManager::new(server.uri());
-        let partners = [
-            PartnerRef {
-                project_id: "partner-1".to_string(),
-                secret_id: "cofhe-tee-fhe-priv".to_string(),
-                wip_audience: String::new(),
-            },
-            PartnerRef {
-                project_id: "partner-2".to_string(),
-                secret_id: "cofhe-tee-zk-signer".to_string(),
-                wip_audience: String::new(),
-            },
-        ];
-        assert!(read_shares(&sm, &same_token(&partners, "tok"))
-            .await
-            .is_err());
     }
 
     // A secret whose bytes aren't a valid envelope is rejected (not a panic).
@@ -652,7 +555,9 @@ mod tests {
             secret_id: "cofhe-tee-fhe-priv".to_string(),
             wip_audience: String::new(),
         };
-        assert!(read_share(&sm, "tok", &partner).await.is_err());
+        assert!(read_share_at(&sm, "tok", &partner, SecretVersion::Latest)
+            .await
+            .is_err());
     }
 
     // ---- reconstruct_and_validate: the LOCKED liar-detection flow ------------
@@ -916,6 +821,70 @@ mod tests {
         assert_eq!(got, fhe);
     }
 
+    // A failed pinned read names its version, so a rerun shows which pin is wrong.
+    #[tokio::test]
+    async fn a_failed_pinned_read_names_its_version() {
+        let server = MockServer::start().await;
+        let sm = SecretManager::new(server.uri());
+        let partner = PartnerRef {
+            project_id: "p-0".to_string(),
+            secret_id: "cofhe-tee-fhe-priv".to_string(),
+            wip_audience: String::new(),
+        };
+        let pin = SecretVersion::Number(std::num::NonZeroU64::new(7).unwrap());
+        let err = read_share_at(&sm, "t", &partner, pin).await.unwrap_err();
+        assert!(format!("{err:#}").contains("version 7"), "{err:#}");
+    }
+
+    // A pinned read asks Secret Manager for that partner's version, not `latest`;
+    // a partner with no pin still reads `latest`.
+    #[tokio::test]
+    async fn read_fhe_priv_at_reads_the_pinned_version() {
+        let fhe = FhePrivShare {
+            client_key: vec![0x5a; 64],
+            decrypt_signer_priv: vec![0x33; 32],
+        };
+        let payload = fhe.to_canonical_bytes();
+        let shares = shamir::split(&payload, 2, 2, &mut shamir::new_csprng()).unwrap();
+        let ids = ["p-0".to_string(), "p-1".to_string()];
+        let digests = ids
+            .iter()
+            .zip(&shares)
+            .map(|(id, s)| (id.clone(), sha256(s)))
+            .collect();
+        let server = serve_public_material(sha256(&payload), digests).await;
+        for (id, (share, version)) in ids.iter().zip(shares.iter().zip(["7", "latest"])) {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/v1/projects/{id}/secrets/cofhe-tee-fhe-priv/versions/{version}:access"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "name": format!("projects/1/secrets/cofhe-tee-fhe-priv/versions/{version}"),
+                    "payload": { "data": envelope_b64(share.clone()) }
+                })))
+                .mount(&server)
+                .await;
+        }
+        let refs: Vec<PartnerRef> = ids
+            .iter()
+            .map(|id| PartnerRef {
+                project_id: id.clone(),
+                secret_id: "cofhe-tee-fhe-priv".to_string(),
+                wip_audience: String::new(),
+            })
+            .collect();
+        let sm = SecretManager::new(server.uri());
+        let gcs = GcsClient::new(server.uri());
+        let pin = |id: &str| match id {
+            "p-0" => SecretVersion::Number(std::num::NonZeroU64::new(7).unwrap()),
+            _ => SecretVersion::Latest,
+        };
+        let got = read_fhe_priv_at(&ctx(&sm, &gcs), &same_token(&refs, "tok"), 2, &pin)
+            .await
+            .unwrap();
+        assert_eq!(got, fhe);
+    }
+
     // Per-partner SM tokens: each partner is wrapped in a PartnerAccess carrying a
     // DISTINCT token, and each partner's mock SM ONLY answers when called with THAT
     // partner's bearer (`.and(header("authorization", "Bearer tok-{i}"))`). If the
@@ -1099,5 +1068,56 @@ mod tests {
             let id = format!("partner-{i}");
             assert!(err.contains(&id), "bad partner {id} missing from: {err}");
         }
+    }
+
+    // After a reshare the manifest lists only the new split. A staying partner that
+    // still serves its old share, a removed partner, and a mix of old and new shares
+    // must never reconstruct: old and new shares lie on different polynomials.
+    #[tokio::test]
+    async fn read_fhe_priv_after_reshare_uses_only_new_shares() {
+        let fhe = FhePrivShare {
+            client_key: vec![0x6c; 80],
+            decrypt_signer_priv: vec![0x44; 32],
+        };
+        let payload = fhe.to_canonical_bytes();
+        let mut rng = shamir::new_csprng();
+        // Old set p-0, p-1, p-2; new set p-1, p-3. Both 2-of-n.
+        let old = shamir::split(&payload, 3, 2, &mut rng).unwrap();
+        let new = shamir::split(&payload, 2, 2, &mut rng).unwrap();
+        let digests = vec![
+            ("p-1".to_string(), sha256(&new[0])),
+            ("p-3".to_string(), sha256(&new[1])),
+        ];
+        let partners = vec![
+            ("p-0".to_string(), Serve::WrongBytes(old[0].clone())), // removed
+            ("p-1".to_string(), Serve::ShareOk(new[0].clone())),
+            ("p-2".to_string(), Serve::WrongBytes(old[2].clone())), // removed
+            ("p-3".to_string(), Serve::ShareOk(new[1].clone())),
+        ];
+        let (server, refs) =
+            serve_fhe_priv_split(sha256(&payload), digests.clone(), &partners).await;
+        let sm = SecretManager::new(server.uri());
+        let gcs = GcsClient::new(server.uri());
+        let got = read_fhe_priv(&ctx(&sm, &gcs), &same_token(&refs, "tok"), 2)
+            .await
+            .unwrap();
+        assert_eq!(got, fhe);
+
+        // p-1 is a staying partner that still serves its OLD share. With p-3 that is
+        // one old and one new share: the reader refuses, and names both bad partners.
+        let partners = vec![
+            ("p-0".to_string(), Serve::WrongBytes(old[0].clone())),
+            ("p-1".to_string(), Serve::WrongBytes(old[1].clone())),
+            ("p-3".to_string(), Serve::ShareOk(new[1].clone())),
+        ];
+        let (server, refs) = serve_fhe_priv_split(sha256(&payload), digests, &partners).await;
+        let sm = SecretManager::new(server.uri());
+        let gcs = GcsClient::new(server.uri());
+        let err = read_fhe_priv(&ctx(&sm, &gcs), &same_token(&refs, "tok"), 2)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unrecoverable"), "got: {err}");
+        assert!(err.contains("p-0") && err.contains("p-1"), "got: {err}");
     }
 }

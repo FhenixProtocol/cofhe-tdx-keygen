@@ -27,8 +27,7 @@ The **consumers embed** the portable reader
 (`crates/cofhe-keys/src/reader.rs`). `read_fhe_priv` and `read_zk_signer` do the whole
 Shamir job: they gather every partner's share fault-tolerantly, filter liars by
 per-share digest fail-closed, reconstruct from T, validate against the published full
-digest, and return the typed component. (`read_share` is the single-secret unit;
-`read_public` reads the public material.)
+digest, and return the typed component. (`read_public` reads the public material.)
 
 ---
 

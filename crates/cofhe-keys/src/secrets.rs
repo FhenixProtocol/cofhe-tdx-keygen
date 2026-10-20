@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::Client;
 use serde::Deserialize;
+use std::num::NonZeroU64;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -16,8 +17,26 @@ pub struct SecretManager {
     http: Client,
 }
 
+/// Which version of a secret to read. Secret Manager numbers versions from 1, so a
+/// zero version cannot be expressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretVersion {
+    Latest,
+    Number(NonZeroU64),
+}
+
+impl std::fmt::Display for SecretVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SecretVersion::Latest => f.write_str("latest"),
+            SecretVersion::Number(n) => write!(f, "{n}"),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct AccessResponse {
+    name: String,
     payload: Payload,
 }
 
@@ -39,17 +58,18 @@ impl SecretManager {
         }
     }
 
-    // Read path: used by the consumer `reader` to fetch a partner's secret
-    // envelope (the keygen write path itself never reads).
-    pub async fn access(
+    /// Read one version of a secret. Returns the resolved version resource name with
+    /// the payload, so a caller that reads `latest` can record which version it got.
+    pub async fn access_version(
         &self,
         access_token: &str,
         project_id: &str,
         secret_name: &str,
-    ) -> Result<Zeroizing<Vec<u8>>> {
+        version: SecretVersion,
+    ) -> Result<(String, Zeroizing<Vec<u8>>)> {
         let url = format!(
-            "{}/v1/projects/{}/secrets/{}/versions/latest:access",
-            self.base_url, project_id, secret_name
+            "{}/v1/projects/{}/secrets/{}/versions/{}:access",
+            self.base_url, project_id, secret_name, version
         );
         let resp = self
             .http
@@ -67,7 +87,7 @@ impl SecretManager {
         let decoded = STANDARD
             .decode(parsed.payload.data)
             .context("base64 decode")?;
-        Ok(Zeroizing::new(decoded))
+        Ok((parsed.name, Zeroizing::new(decoded)))
     }
 
     /// Add a new version to an existing secret (Secret Manager `addVersion`).
@@ -129,8 +149,37 @@ mod tests {
             .await;
 
         let sm = SecretManager::new(server.uri());
-        let bytes = sm.access("sa-xyz", "test-project", "k1").await.unwrap();
+        let (_, bytes) = sm
+            .access_version("sa-xyz", "test-project", "k1", SecretVersion::Latest)
+            .await
+            .unwrap();
         assert_eq!(bytes.as_slice(), raw);
+    }
+
+    #[tokio::test]
+    async fn access_version_reads_explicit_version_and_returns_name() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/projects/p/secrets/s/versions/7:access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "projects/123/secrets/s/versions/7",
+                "payload": { "data": STANDARD.encode(b"hi") }
+            })))
+            .mount(&server)
+            .await;
+
+        let sm = SecretManager::new(server.uri());
+        let (name, bytes) = sm
+            .access_version(
+                "t",
+                "p",
+                "s",
+                SecretVersion::Number(NonZeroU64::new(7).unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(name, "projects/123/secrets/s/versions/7");
+        assert_eq!(bytes.as_slice(), b"hi");
     }
 
     #[tokio::test]
@@ -141,7 +190,10 @@ mod tests {
             .mount(&server)
             .await;
         let sm = SecretManager::new(server.uri());
-        assert!(sm.access("t", "p", "n").await.is_err());
+        assert!(sm
+            .access_version("t", "p", "n", SecretVersion::Latest)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
