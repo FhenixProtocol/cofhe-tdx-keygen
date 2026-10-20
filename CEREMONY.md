@@ -145,6 +145,12 @@ The partner set, the Shamir N and T, the secret ids, and the public bucket and p
 They are not deployment variables. Changing any of them is a rebuild plus a partner
 re-pin. The selector fails closed on any value outside the baked map.
 
+A ceremony refuses to run while a live manifest exists at that bucket and prefix. So
+an image built from the wrong env cannot replace a live keyset. A deliberate key
+rotation bakes `replace_live_keyset: true` in the env, and that needs review like any
+other env change. After the rotation, set it back to `false` and release, so the
+guard is on again for the next image.
+
 Inside the VM, the run does five things, and each is visible in the log: fetch the
 attestation token, generate the keyset, Shamir-split each secret, write one share per
 partner through that partner's gate, and publish the public material and digests. It
@@ -240,5 +246,72 @@ The shipped defaults suit development. A real deployment adds all four.
 - **Who runs the partner stack.** In production the partner runs it in their own project.
   An environment where we own the partner projects **demonstrates** the model; it does
   not enforce it, because we are owners there.
-- **Live key rotation is future work.** Today a re-run appends a fresh keyset as a new
-  secret version across all partners, which invalidates existing ciphertexts.
+- **A re-run over a live keyset is refused.** A ceremony image stops when a live
+  manifest exists, unless the env bakes `replace_live_keyset: true`. A deliberate key
+  rotation writes a fresh keyset to all partners, which invalidates existing
+  ciphertexts.
+
+## 5. Reshare — change the partner set, keep the keyset
+
+Use a reshare to add or replace a key-share holder. Do not use it after a suspected
+leak: old shares still rebuild the key. Run a new ceremony instead.
+
+1. **Bake the change.** In `crates/cofhe-keys/src/envs.rs`, copy the live set into
+   `reshare_from` with its threshold and the two live signer addresses (they are
+   on-chain). Set `partners` and `shamir_threshold` to the target set. An env with
+   `reshare_from` builds a reshare-only image: it can never run a ceremony. CI checks
+   the env. Release the image (Step 2).
+2. **Rebuild the consumers** with the new `cofhe-keys`. Do not deploy them yet.
+3. **Partners apply.**
+   - A source partner that stays: `grant_reshare_read = true` and
+     `grant_write_access = true`.
+   - A source partner that leaves: `grant_reshare_read = true`. This is optional: the
+     run needs only the old threshold of sources.
+   - A source partner's read needs `grant_read_access = true` too: that flag is the
+     read brake, and it also disables the keygen gate.
+   - A new partner: onboard (Step 1) with `grant_write_access = true`.
+   - Every partner pins the new keygen digest (Step 3).
+4. **Start the maintenance window.** Do not restart a consumer until step 6.
+5. **Run** with `run_ceremony = true`. The image runs the reshare. The log names
+   each source share version it read (`"read share"` lines). Before it writes, the
+   run checks the rebuilt key against the published keys and signers. To run the
+   same check by hand: `verify reconstruct --env <env> --threshold <old T> --check-keys`.
+6. **Deploy the rebuilt consumers.** Confirm a decrypt and a ZK verification.
+7. **End the window.** Set `run_ceremony = false`. Partners set `grant_reshare_read`
+   and `grant_write_access` back to `false`. Remove `reshare_from` and release.
+8. **Keep the old versions.** No partner destroys a secret version after a reshare.
+   Rollback needs them. If Fhenix later wants an old share gone, it asks that partner
+   explicitly, and the partner removes it by hand.
+
+**If the run stops before the manifest is published,** rerun first. Source partners
+are written last, and the reader drops a source share that the manifest does not list,
+so a plain rerun works while the old threshold of source partners is untouched. The
+VM runs its container once, so a rerun is `run_ceremony = false`, apply, then
+`run_ceremony = true`, apply.
+
+Pin only if the rerun fails with fewer than T good shares. Take the source versions
+from the failed run's log (`"read share"` lines) and bake them in `reshare_from.pins`:
+`SourcePin { project_id: "<partner>", fhe_priv: NonZeroU64::new(<version>), zk_signer: NonZeroU64::new(<version>) }`.
+Pin each secret on its own: their version numbers can differ. A secret with no pin
+reads `latest`. Release the image, partners pin the new digest (Step 3), and rerun.
+
+**A rerun after the manifest is published** stops before any write when the reshare
+changed the partner set: the live manifest lists the target set, not the source set.
+After a reshare that changed only T on the same set, a rerun is not caught. It splits
+again, which loses nothing, so do not rerun a finished reshare.
+
+**If the run stops before the first write,** nothing changed. Fix the cause and rerun.
+
+Do not disable a secret version to recover: Secret Manager `latest` then fails. It
+does not fall back to the previous version.
+
+**To roll back,** reshare back: bake `reshare_from` = the new set and `partners` = the
+old set, and run this procedure again with the old consumers. A removed partner must
+keep its secret, and must be able to set `grant_write_access = true` again.
+
+**Emergency rollback only:** restore `public-material.prev.<digest>` (the copy this
+reshare made, named by the old manifest's SHA-256; the run logs the name as
+`keeping a copy of the live manifest`) over the manifest. Each
+staying partner adds a new version of both secrets with the old share payload, copied
+from the old version in its own project. Then redeploy the old consumers. This is
+fast, but partners handle secret bytes by hand.

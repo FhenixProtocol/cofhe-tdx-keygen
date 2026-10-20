@@ -1,9 +1,8 @@
 //! Baked environment source — the compile-time key SOURCE shared by BOTH sides of
 //! the crate: the producer keygen (write side, `writer` feature) and the consumer
 //! reader (read side, `reader` feature). It is deliberately UNCONDITIONAL (no
-//! feature gate) so the write-only enclave image — built `--no-default-features`
-//! with just `writer` — can still resolve its env via [`lookup`] without pulling in
-//! the reader's async fetch stack. The `reader` module re-exports these items, so
+//! feature gate) so every feature set resolves its env via [`lookup`]. The `reader`
+//! module re-exports these items, so
 //! existing `cofhe_keys::reader::{lookup, env_names, EnvConfig, EnvPartner}` paths
 //! keep working for read-side consumers unchanged.
 
@@ -57,7 +56,9 @@ pub struct EnvConfig {
     /// with this field can only reshare; without it, only a ceremony. Remove it once
     /// the reshare is done.
     pub reshare_from: Option<ReshareSource>,
-    /// Set this only for a deliberate new keyset (a key rotation). It has no
+    /// A ceremony refuses to run while a live manifest exists, so an image built
+    /// from the wrong env cannot replace the live keyset. Set this only for a
+    /// deliberate new keyset (a key rotation), and unset it after. It has no
     /// meaning for a reshare.
     pub replace_live_keyset: bool,
 }

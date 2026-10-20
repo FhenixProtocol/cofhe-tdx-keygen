@@ -36,7 +36,8 @@ Invariants — do not break these (see `DESIGN.md` for the rationale behind each
   only splits it again. Both are all-or-nothing.
 - The baked env decides the run, with no runtime input: an env with
   `reshare_from` builds a reshare-only image, and any other env a ceremony-only
-  image.
+  image. A ceremony refuses to replace a live keyset unless the env bakes
+  `replace_live_keyset: true`.
 
 Writing docs and comments: active voice, present tense, one idea per sentence,
 simple words. State operator cautions as instructions, not alarms. Never claim an
