@@ -118,13 +118,15 @@ struct Config {
     // this ceremony's keyset directly.
     public_prefix: String,
     zone: u32,
+    // The baked env: every target partner gets both shares at its `share_version`.
+    env: &'static EnvConfig,
 }
 
 #[cfg(not(feature = "mock"))]
 impl Config {
     // `COFHE_ENV` is the ONLY operator-settable input (besides `RUST_LOG`, honored by
     // tracing) — it selects a BAKED environment and nothing else. Everything else,
-    // the run mode and the recovery pins included, is compiled in, so a VM metadata
+    // the run mode and the share versions included, is compiled in, so a VM metadata
     // override cannot redirect the write set, weaken the threshold, repoint the
     // public bucket, or turn a reshare into a ceremony.
     fn from_env() -> Result<Self> {
@@ -148,15 +150,7 @@ impl Config {
         // Fail before a single key is generated or read. A placeholder audience would
         // otherwise abort the run mid-write, after earlier partners are written.
         ec.ensure_partners_complete()?;
-        // The ceremony writes the manifest at `{prefix}/{zone}`; consumers read
-        // `public_object`. Both must name the same object.
-        let manifest = object_path(ec.public_prefix, ec.public_zone, OBJ_MANIFEST);
-        if ec.public_object != manifest {
-            bail!(
-                "public_object {:?} is not the manifest path {manifest:?}",
-                ec.public_object
-            );
-        }
+        ec.check_versions()?;
         let mode = match &ec.reshare_from {
             None => Mode::Ceremony,
             Some(_) if ec.replace_live_keyset => {
@@ -183,6 +177,7 @@ impl Config {
             public_bucket: ec.public_bucket.to_string(),
             public_prefix: ec.public_prefix.to_string(),
             zone: ec.public_zone,
+            env: ec,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -231,25 +226,12 @@ impl Config {
         // An empty audience would fail later as an opaque STS 403, like a target's.
         if r.partners
             .iter()
-            .any(|s| s.project_id.is_empty() || s.wip_pool_audience.is_empty())
+            .any(|s| s.partner.project_id.is_empty() || s.partner.wip_pool_audience.is_empty())
         {
             bail!("a reshare source partner has an empty project_id or wip_pool_audience");
         }
-        check_distinct(r.partners.iter().map(|s| s.project_id)).context("reshare source")?;
-        for pin in r.pins {
-            if !r.partners.iter().any(|s| s.project_id == pin.project_id) {
-                bail!(
-                    "a reshare pin names {:?}, which is not a reshare source partner",
-                    pin.project_id
-                );
-            }
-            // A pin that names no version would read version 1, not the version it
-            // exists to name.
-            if pin.fhe_priv.is_none() && pin.zk_signer.is_none() {
-                bail!("the reshare pin for {:?} pins no version", pin.project_id);
-            }
-        }
-        check_distinct(r.pins.iter().map(|p| p.project_id)).context("reshare pins")?;
+        check_distinct(r.partners.iter().map(|s| s.partner.project_id))
+            .context("reshare source")?;
         for (what, address) in [
             ("decrypt_signer_address", r.decrypt_signer_address),
             ("zk_signer_address", r.zk_signer_address),
@@ -262,20 +244,6 @@ impl Config {
             {
                 bail!("the reshare anchor {what} {address:?} is not a lowercase 0x-prefixed EVM address");
             }
-        }
-        let source: BTreeSet<&str> = r.partners.iter().map(|s| s.project_id).collect();
-        let target: BTreeSet<&str> = self
-            .partners
-            .iter()
-            .map(|p| p.project_id.as_str())
-            .collect();
-        // Same set and same T is a no-op, except with pins: that cancels a reshare
-        // that stopped mid-write, by splitting the old set again from its old
-        // versions, so every partner's newest version is a share the manifest lists.
-        if source == target && r.shamir_threshold == self.threshold && r.pins.is_empty() {
-            bail!(
-                "the reshare source equals the target set with the same threshold: nothing to do"
-            );
         }
         Ok(())
     }
@@ -340,8 +308,9 @@ async fn main() -> Result<()> {
 async fn real_boot() -> Result<()> {
     let cfg = Config::from_env()?;
     if let Mode::Reshare(r) = cfg.mode {
+        info!(share_version = %cfg.env.share_version, source_manifest = %r.manifest_object(cfg.env), "reshare target");
         for s in r.partners {
-            info!(partner = %s.project_id, fhe_priv_version = ?r.version_of(s.project_id, |p| p.fhe_priv), zk_signer_version = ?r.version_of(s.project_id, |p| p.zk_signer), "reshare source");
+            info!(partner = %s.partner.project_id, share_version = %r.version_for(s.partner.project_id), "reshare source");
         }
         bail!(
             "reshare image: this build validates a reshare config ({} sources, T={}, live signers {} and {}) but cannot run one",
@@ -525,8 +494,7 @@ async fn write_secret(
 #[cfg(all(test, not(feature = "mock")))]
 mod tests {
     use super::*;
-    use cofhe_keys::envs::{EnvPartner, SourcePin};
-    use std::num::NonZeroU64;
+    use cofhe_keys::envs::{v, EnvPartner, SourcePartner};
 
     fn partner(id: &str) -> PartnerCfg {
         PartnerCfg {
@@ -546,6 +514,7 @@ mod tests {
             public_bucket: "bucket".to_string(),
             public_prefix: "keys/versionized".to_string(),
             zone: 0,
+            env: cofhe_keys::envs::lookup("testnet").unwrap(),
         }
     }
 
@@ -690,6 +659,19 @@ mod tests {
         )
     }
 
+    fn sources(partners: &[EnvPartner]) -> &'static [SourcePartner] {
+        Box::leak(
+            partners
+                .iter()
+                .map(|&partner| SourcePartner {
+                    partner,
+                    share_version: None,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+    }
+
     const P1: (&str, &str) = ("p-1", "111111111111");
     const P2: (&str, &str) = ("p-2", "222222222222");
     const P3: (&str, &str) = ("p-3", "333333333333");
@@ -706,16 +688,17 @@ mod tests {
         Box::leak(Box::new(EnvConfig {
             partners: target,
             public_bucket: "b",
-            public_object: "p/0/public-material",
             public_prefix: "p",
             public_zone: 0,
             shamir_threshold: t,
+            share_version: v(2),
             reshare_from: source.map(|(partners, shamir_threshold)| ReshareSource {
-                partners,
+                partners: sources(partners),
                 shamir_threshold,
+                share_version: v(1),
+                legacy_manifest: false,
                 decrypt_signer_address: LIVE_DECRYPT,
                 zk_signer_address: LIVE_ZK,
-                pins: &[],
             }),
             replace_live_keyset: false,
         }))
@@ -732,12 +715,12 @@ mod tests {
         let Mode::Reshare(r) = &cfg.mode else {
             panic!("expected reshare mode")
         };
-        let ids: Vec<&str> = r.partners.iter().map(|s| s.project_id).collect();
+        let ids: Vec<&str> = r.partners.iter().map(|s| s.partner.project_id).collect();
         assert_eq!(ids, ["p-1", "p-2", "p-3"]);
         assert_eq!(r.shamir_threshold, 2);
         let targets: Vec<&str> = cfg.partners.iter().map(|p| p.project_id.as_str()).collect();
         assert_eq!(targets, ["p-1", "p-2", "p-4"]);
-        assert!(r.pins.is_empty());
+        assert_eq!(cfg.env.share_version.get(), 2);
     }
 
     // An env without a reshare source builds a ceremony image.
@@ -763,50 +746,6 @@ mod tests {
         assert!(Config::from_env_config(e).is_err());
     }
 
-    fn with_pins(pins: &'static [SourcePin]) -> &'static EnvConfig {
-        let src = replace_env().reshare_from.as_ref().unwrap();
-        Box::leak(Box::new(EnvConfig {
-            reshare_from: Some(ReshareSource { pins, ..*src }),
-            ..*replace_env()
-        }))
-    }
-
-    // A pin applies to the one partner and secret it names; everything else has none.
-    #[test]
-    fn reshare_pins_default_to_none() {
-        let e = with_pins(Box::leak(Box::new([SourcePin {
-            project_id: "p-1",
-            fhe_priv: NonZeroU64::new(3),
-            zk_signer: None,
-        }])));
-        let cfg = Config::from_env_config(e).unwrap();
-        let Mode::Reshare(r) = cfg.mode else {
-            panic!("expected reshare mode")
-        };
-        let v = |id, pick: fn(&SourcePin) -> Option<NonZeroU64>| r.version_of(id, pick);
-        assert_eq!(v("p-1", |p| p.fhe_priv), NonZeroU64::new(3));
-        assert_eq!(v("p-1", |p| p.zk_signer), None);
-        assert_eq!(v("p-2", |p| p.fhe_priv), None);
-    }
-
-    #[test]
-    fn bad_pins_fail_closed() {
-        let pin = |id: &'static str, fhe: u64| SourcePin {
-            project_id: id,
-            fhe_priv: NonZeroU64::new(fhe),
-            zk_signer: None,
-        };
-        for pins in [
-            vec![pin("p-4", 3)],
-            vec![pin("nobody", 3)],
-            vec![pin("p-1", 3), pin("p-1", 4)],
-            vec![pin("p-1", 0)],
-        ] {
-            let pins: &'static [SourcePin] = Box::leak(pins.into_boxed_slice());
-            assert!(Config::from_env_config(with_pins(pins)).is_err());
-        }
-    }
-
     // The baked anchor pins the live keyset by its public signer addresses. A
     // malformed anchor must stop the build of the config, not the run.
     #[test]
@@ -823,11 +762,12 @@ mod tests {
             for (decrypt, zk) in [(bad, LIVE_ZK), (LIVE_DECRYPT, bad)] {
                 let e = Box::leak(Box::new(EnvConfig {
                     reshare_from: Some(ReshareSource {
-                        partners: set(&[P1, P2, P3]),
+                        partners: sources(set(&[P1, P2, P3])),
                         shamir_threshold: 2,
+                        share_version: v(1),
+                        legacy_manifest: false,
                         decrypt_signer_address: decrypt,
                         zk_signer_address: zk,
-                        pins: &[],
                     }),
                     ..*env(set(&[P1, P2, P4]), 2, None)
                 }));
@@ -839,26 +779,26 @@ mod tests {
         }
     }
 
+    // Source < target makes every reshare write new versions, so a same-set,
+    // same-T reshare is a real change: it moves the shares to a new version.
     #[test]
-    fn reshare_rejects_a_no_op() {
+    fn a_same_set_reshare_to_a_new_version_is_allowed() {
         let same = env(set(&[P1, P2, P3]), 2, Some((set(&[P3, P2, P1]), 2)));
-        assert!(Config::from_env_config(same).is_err());
-        // Same set with a new T is a real change.
-        let new_t = env(set(&[P1, P2, P3]), 3, Some((set(&[P1, P2, P3]), 2)));
-        assert!(Config::from_env_config(new_t).is_ok());
-        // Same set and T with pins cancels a stopped reshare: allowed.
-        let cancel = Box::leak(Box::new(EnvConfig {
+        assert!(Config::from_env_config(same).is_ok());
+    }
+
+    // The env refuses a source version at or above the target before any read.
+    #[test]
+    fn a_source_version_at_the_target_is_refused() {
+        let src = replace_env().reshare_from.as_ref().unwrap();
+        let e = Box::leak(Box::new(EnvConfig {
             reshare_from: Some(ReshareSource {
-                pins: Box::leak(Box::new([SourcePin {
-                    project_id: "p-1",
-                    fhe_priv: NonZeroU64::new(1),
-                    zk_signer: NonZeroU64::new(1),
-                }])),
-                ..*same.reshare_from.as_ref().unwrap()
+                share_version: v(2),
+                ..*src
             }),
-            ..*env(set(&[P1, P2, P3]), 2, None)
+            ..*replace_env()
         }));
-        assert!(Config::from_env_config(cancel).is_ok());
+        assert!(Config::from_env_config(e).is_err());
     }
 
     #[test]
@@ -883,22 +823,9 @@ mod tests {
         assert!(Config::from_env_config(empty_audience).is_err());
     }
 
-    // The run writes the manifest at `{prefix}/{zone}`, and consumers read
-    // `public_object`. An env where they differ is refused, so the replace guard
-    // always checks the object consumers read.
-    #[test]
-    fn public_object_must_be_the_manifest_path() {
-        let e = Box::leak(Box::new(EnvConfig {
-            public_object: "p/1/public-material",
-            reshare_from: None,
-            ..*env(set(&[P1, P2, P3]), 2, None)
-        }));
-        assert!(Config::from_env_config(e).is_err());
-    }
-
     // The CI gate for baked config: every baked env with a complete partner set must
     // build. Each env runs exactly one mode by construction, so a bad reshare source
-    // or pin fails CI and never reaches a release. A declared but unfilled partner
+    // or share version fails CI and never reaches a release. A declared but unfilled partner
     // slot fails on purpose.
     #[test]
     fn every_baked_env_validates() {

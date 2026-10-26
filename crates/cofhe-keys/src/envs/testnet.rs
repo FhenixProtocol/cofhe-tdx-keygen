@@ -21,10 +21,12 @@ pub(super) const PARTNERS: &[EnvPartner] = &[
 pub(super) const TESTNET: EnvConfig = EnvConfig {
     partners: PARTNERS,
     public_bucket: "fhenix-testnet-v2",
-    public_object: "generator/keys/versionized/0/public-material",
     public_prefix: "generator/keys/versionized",
     public_zone: 0,
     shamir_threshold: 2,
+    share_version: v(1),
+    // For a reshare to a new set, write the source entries in full, not as
+    // `PARTNERS[i]`: an edit of `PARTNERS` to the target set would change them too.
     reshare_from: None,
     replace_live_keyset: false,
 };

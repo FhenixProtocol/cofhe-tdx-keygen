@@ -12,7 +12,8 @@ use anyhow::{bail, Context, Result};
 use cofhe_keys::gcs::GcsClient;
 use cofhe_keys::keygen;
 use cofhe_keys::reader::{
-    lookup, partner_refs, read_fhe_priv, read_zk_signer, PartnerAccess, PartnerRef, ReaderContext,
+    lookup, partner_refs, read_fhe_priv, read_zk_signer, EnvConfig, PartnerAccess, PartnerRef,
+    ReaderContext,
 };
 use cofhe_keys::secrets::SecretManager;
 use cofhe_keys::serialization::{self, SecretEnvelope};
@@ -242,7 +243,7 @@ fn operator_access<'a>(refs: &'a [PartnerRef], token: &'a str) -> Vec<PartnerAcc
 struct ReconArgs {
     env: String,
     threshold: u8,
-    version: NonZeroU64,
+    version: Option<NonZeroU64>,
     token: String,
     // Optional operator OVERRIDES: default to the baked env source. An
     // explicit flag still wins, for testing against an ad-hoc bucket/object.
@@ -258,15 +259,16 @@ struct ReconArgs {
 fn recon_usage() -> ! {
     eprintln!(
         "usage: verify reconstruct --env <staging|testnet|mainnet> --threshold <T> \\\n  \
-         --version <N> --token <access_token> \\\n  \
+         --token <access_token> [--version <N>] \\\n  \
          [--bucket <name>] [--public-object <name>] \\\n  \
          [--secret-fhe-priv <s>] [--secret-zk-signer <s>] \\\n  \
          [--sm-url <url>] [--gcs-url <url>] [--check-keys]\n\n\
-         The partner set AND the public-material bucket/object are BAKED per\n\
-         environment — --env selects them and fails closed on anything\n\
-         else. --bucket / --public-object are optional OVERRIDES for testing against\n\
-         an ad-hoc location; omitted, they default to the baked env source. Fetches\n\
-         each partner's share at version N (there is no latest), reconstructs both\n\
+         The partner set, the share version AND the public-material bucket/object\n\
+         are BAKED per environment — --env selects them and fails closed on anything\n\
+         else. --version / --bucket / --public-object are optional OVERRIDES for\n\
+         testing against an ad-hoc location; omitted, they default to the baked env\n\
+         share_version and the manifest of the version in use. Fetches each\n\
+         partner's share at that version (there is no latest), reconstructs both\n\
          secrets from T good shares, and validates them against the published full\n\
          digests. --check-keys also proves the rebuilt key is the key behind the\n\
          published public keys and signers (the check a reshare runs before it writes)."
@@ -314,7 +316,7 @@ fn parse_reconstruct_args(argv: &[String]) -> Result<ReconArgs> {
     Ok(ReconArgs {
         env: env.context("--env is required")?,
         threshold: threshold.context("--threshold is required")?,
-        version: version.context("--version is required")?,
+        version,
         token: token.context("--token is required")?,
         bucket,
         sm_url: require_https("--sm-url", sm_url)?,
@@ -324,6 +326,18 @@ fn parse_reconstruct_args(argv: &[String]) -> Result<ReconArgs> {
         secret_zk_signer,
         check_keys,
     })
+}
+
+/// The share version and the manifest object to check it against. A `--version`
+/// alone checks that version's own manifest, not the baked one.
+fn recon_target(
+    env: &EnvConfig,
+    version: Option<NonZeroU64>,
+    public_object: Option<&str>,
+) -> (NonZeroU64, String) {
+    let version = version.unwrap_or(env.share_version);
+    let manifest = public_object.map_or_else(|| env.manifest_at(version), str::to_string);
+    (version, manifest)
 }
 
 async fn reconstruct_main(argv: &[String]) -> Result<()> {
@@ -352,7 +366,8 @@ async fn reconstruct_main(argv: &[String]) -> Result<()> {
     // consistent-by-default with what the consumers read; an explicit --bucket /
     // --public-object still wins (operator testing against an ad-hoc bucket).
     let public_bucket = a.bucket.as_deref().unwrap_or(env_cfg.public_bucket);
-    let public_object = a.public_object.as_deref().unwrap_or(env_cfg.public_object);
+    let (version, manifest) = recon_target(env_cfg, a.version, a.public_object.as_deref());
+    let public_object = manifest.as_str();
 
     let sm = SecretManager::new(&a.sm_url);
     let gcs = GcsClient::new(&a.gcs_url);
@@ -374,7 +389,7 @@ async fn reconstruct_main(argv: &[String]) -> Result<()> {
         &ctx,
         &operator_access(&fhe_partners, &a.token),
         a.threshold,
-        &|_| a.version,
+        &|_| version,
     )
     .await
     .context("reconstruct fhe-priv")?;
@@ -388,7 +403,7 @@ async fn reconstruct_main(argv: &[String]) -> Result<()> {
         &ctx,
         &operator_access(&zk_partners, &a.token),
         a.threshold,
-        &|_| a.version,
+        &|_| version,
     )
     .await
     .context("reconstruct zk-signer")?;
@@ -448,7 +463,7 @@ async fn reconstruct_main(argv: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod reconstruct_args_tests {
-    use super::parse_reconstruct_args;
+    use super::{parse_reconstruct_args, recon_target};
 
     fn argv(extra: &[&str]) -> Vec<String> {
         [
@@ -467,6 +482,23 @@ mod reconstruct_args_tests {
         .chain(extra)
         .map(|s| s.to_string())
         .collect()
+    }
+
+    #[test]
+    fn a_version_without_a_public_object_reads_its_own_manifest() {
+        let env = super::lookup("staging").unwrap();
+        let five = std::num::NonZeroU64::new(5).unwrap();
+        let (version, manifest) = recon_target(env, Some(five), None);
+        assert_eq!(version, five);
+        assert_eq!(
+            manifest,
+            format!("{}/public-material.v5", env.manifest_dir())
+        );
+        let (_, manifest) = recon_target(env, Some(five), Some("x/y"));
+        assert_eq!(manifest, "x/y");
+        let (version, manifest) = recon_target(env, None, None);
+        assert_eq!(version, env.share_version);
+        assert_eq!(manifest, env.manifest_object());
     }
 
     #[test]

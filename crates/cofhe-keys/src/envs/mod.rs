@@ -20,7 +20,8 @@ use testnet::TESTNET;
 
 /// The reader's key SOURCE is baked at compile time — never operator-settable.
 /// One entry per blessed env. Onboarding an env, and changing a partner SET within
-/// one, are both rebuilds by design; a same-set reshare touches nothing here.
+/// one, are both rebuilds by design; a same-set reshare changes only the versions.
+#[derive(Clone, Copy)]
 pub struct EnvPartner {
     pub project_id: &'static str,
     /// Pool-level audience at this partner:
@@ -38,24 +39,26 @@ pub struct EnvPartner {
 }
 
 /// One blessed environment's key source: the partner set holding the Shamir
-/// shares, the public-material location, and the reconstruction threshold. Shared
-/// by the consumer readers (which read `public_object` + reconstruct with
-/// `shamir_threshold`) and the producer keygen (which writes to `keygen_write_audience`
-/// and lays out `{public_prefix}/{public_zone}/…`), so producer and consumer agree
-/// on the partner set and T by construction.
+/// shares, the share version, the public-material location, and the
+/// reconstruction threshold. Shared by the consumer readers (which read
+/// [`EnvConfig::manifest_object`] and the shares at `share_version`, then
+/// reconstruct with `shamir_threshold`) and the producer keygen (which writes to
+/// `keygen_write_audience` and lays out `{public_prefix}/{public_zone}/…`), so
+/// producer and consumer agree on the partner set, the version and T by
+/// construction.
 pub struct EnvConfig {
     pub partners: &'static [EnvPartner],
     pub public_bucket: &'static str,
-    /// The consumer's read path to the manifest =
-    /// `{public_prefix}/{public_zone}/public-material`.
-    pub public_object: &'static str,
     /// Producer-side layout: the ceremony writes
-    /// `{public_prefix}/{public_zone}/{computation_key,public_key,crs,public-material}`.
+    /// `{public_prefix}/{public_zone}/{computation_key,public_key,crs}` and the
+    /// manifest at [`EnvConfig::manifest_object`].
     pub public_prefix: &'static str,
     pub public_zone: u32,
     /// Shamir reconstruction threshold (T). Baked once here so the producer's split
     /// and every consumer's reconstruct agree on T (N is the partner count).
     pub shamir_threshold: u8,
+    /// Target version: every partner holds both shares at this number.
+    pub share_version: NonZeroU64,
     /// The partner set that holds the live shares, when the next keygen run is a
     /// reshare. `partners` and `shamir_threshold` above are then the target set.
     /// Consumers read no shares from this set, but their placeholder gate still
@@ -69,43 +72,57 @@ pub struct EnvConfig {
 }
 
 /// The source of a reshare: the partner set that holds the live shares, the
-/// threshold those shares were split with, and an anchor on the live keyset.
+/// threshold and version those shares were written with, and an anchor on the
+/// live keyset.
 ///
 /// The anchor is the two signer addresses of the live keyset. They are public and
 /// on-chain. The reshare refuses a manifest whose addresses differ, so a bucket
 /// writer cannot swap in an older keyset's manifest, and with it an older key, for
 /// the run to split again.
 pub struct ReshareSource {
-    pub partners: &'static [EnvPartner],
+    pub partners: &'static [SourcePartner],
     pub shamir_threshold: u8,
+    pub share_version: NonZeroU64,
+    /// The staging migration to unity versions only: the source manifest has the
+    /// legacy unversioned name, and the run also writes that name.
+    pub legacy_manifest: bool,
     pub decrypt_signer_address: &'static str,
     pub zk_signer_address: &'static str,
-    /// Recovery only, normally empty. After a reshare stops mid-write, the newest
-    /// version at a written source partner holds a share that no manifest lists. A pin
-    /// names the version the failed run logged for one partner's secret. A secret that
-    /// no pin names reads version 1, until the env bakes a source version.
-    pub pins: &'static [SourcePin],
 }
 
-/// The Secret Manager versions to read at one source partner. Each secret numbers
-/// its versions on its own, so each has its own pin; `None` is no pin.
-pub struct SourcePin {
-    pub project_id: &'static str,
-    pub fhe_priv: Option<NonZeroU64>,
-    pub zk_signer: Option<NonZeroU64>,
+/// One source partner and the version its two shares sit at.
+pub struct SourcePartner {
+    pub partner: EnvPartner,
+    /// None = ReshareSource.share_version.
+    pub share_version: Option<NonZeroU64>,
+}
+
+/// Builds a baked share version. The env files write every version as `v(N)`,
+/// because scripts outside this crate parse that literal.
+pub const fn v(n: u64) -> NonZeroU64 {
+    match NonZeroU64::new(n) {
+        Some(v) => v,
+        None => panic!("a share version is >= 1"),
+    }
 }
 
 impl ReshareSource {
-    /// The pinned version of one source partner's secret, or `None` without a pin.
-    pub fn version_of(
-        &self,
-        project_id: &str,
-        pick: fn(&SourcePin) -> Option<NonZeroU64>,
-    ) -> Option<NonZeroU64> {
-        self.pins
+    /// The version of both secrets at one source partner.
+    pub fn version_for(&self, project_id: &str) -> NonZeroU64 {
+        self.partners
             .iter()
-            .find(|p| p.project_id == project_id)
-            .and_then(pick)
+            .find(|s| s.partner.project_id == project_id)
+            .and_then(|s| s.share_version)
+            .unwrap_or(self.share_version)
+    }
+
+    /// The manifest that lists the source shares.
+    pub fn manifest_object(&self, env: &EnvConfig) -> String {
+        if self.legacy_manifest {
+            env.legacy_manifest_object()
+        } else {
+            env.manifest_at(self.share_version)
+        }
     }
 }
 
@@ -115,6 +132,59 @@ impl ReshareSource {
 pub const PARTNER_PLACEHOLDER: &str = "FILL-ME-";
 
 impl EnvConfig {
+    /// The folder that holds the public objects: `{public_prefix}/{public_zone}`.
+    pub fn manifest_dir(&self) -> String {
+        format!("{}/{}", self.public_prefix, self.public_zone)
+    }
+
+    /// The manifest of the keyset at `share_version`.
+    pub fn manifest_object(&self) -> String {
+        self.manifest_at(self.share_version)
+    }
+
+    /// The manifest of the keyset at `version`: `{dir}/public-material.v{version}`.
+    pub fn manifest_at(&self, version: NonZeroU64) -> String {
+        format!("{}/public-material.v{version}", self.manifest_dir())
+    }
+
+    /// The manifest name from before share versions. Only the staging migration
+    /// reads it.
+    pub fn legacy_manifest_object(&self) -> String {
+        format!("{}/public-material", self.manifest_dir())
+    }
+
+    /// FAIL-CLOSED: every version a reshare reads is below the target, so every
+    /// reshare writes new versions and never overwrites what readers use. An
+    /// override equal to the source version is a no-op that hides a typo.
+    pub fn check_versions(&self) -> Result<()> {
+        let Some(r) = &self.reshare_from else {
+            return Ok(());
+        };
+        let target = self.share_version;
+        if r.share_version >= target {
+            return Err(anyhow!(
+                "the reshare source share_version {} is not below the target share_version {target}",
+                r.share_version
+            ));
+        }
+        for s in r.partners {
+            let Some(x) = s.share_version else { continue };
+            if x >= target {
+                return Err(anyhow!(
+                    "source partner {:?} share_version {x} is not below the target share_version {target}",
+                    s.partner.project_id
+                ));
+            }
+            if x == r.share_version {
+                return Err(anyhow!(
+                    "source partner {:?} overrides share_version with {x}, which equals the source share_version",
+                    s.partner.project_id
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// FAIL-CLOSED: `Err` while any partner slot is still a placeholder.
     ///
     /// This is deliberately NOT enforced in [`lookup`]. An incomplete env still has a
@@ -123,7 +193,10 @@ impl EnvConfig {
     /// paths that actually touch the partner set: the ceremony's config build and the
     /// reader's reconstruct. Both call this.
     pub fn ensure_partners_complete(&self) -> Result<()> {
-        let sources = self.reshare_from.iter().flat_map(|r| r.partners.iter());
+        let sources = self
+            .reshare_from
+            .iter()
+            .flat_map(|r| r.partners.iter().map(|s| &s.partner));
         let pending: Vec<&str> = self
             .partners
             .iter()
@@ -201,7 +274,7 @@ mod tests {
         for (name, cfg) in ENVIRONMENTS {
             assert!(
                 !cfg.public_bucket.contains(PARTNER_PLACEHOLDER)
-                    && !cfg.public_object.contains(PARTNER_PLACEHOLDER),
+                    && !cfg.manifest_object().contains(PARTNER_PLACEHOLDER),
                 "env {name:?} still has a placeholder public bucket/object"
             );
         }
@@ -277,12 +350,87 @@ mod tests {
         EnvConfig {
             partners,
             public_bucket: "b",
-            public_object: "p/0/public-material",
             public_prefix: "p",
             public_zone: 0,
             shamir_threshold: 2,
+            share_version: v(1),
             reshare_from: None,
             replace_live_keyset: false,
+        }
+    }
+
+    // Partners p1..p3 on both sides; `source` is (version, overrides, legacy_manifest).
+    type Source = Option<(u64, &'static [(&'static str, u64)], bool)>;
+
+    fn env_with_versions(target: u64, source: Source) -> &'static EnvConfig {
+        let ps: &'static [EnvPartner] = Box::leak(
+            vec![
+                partner("p1", "111111111111"),
+                partner("p2", "222222222222"),
+                partner("p3", "333333333333"),
+            ]
+            .into_boxed_slice(),
+        );
+        let mut env = env_with(ps);
+        env.share_version = v(target);
+        env.reshare_from = source.map(|(version, overrides, legacy_manifest)| ReshareSource {
+            partners: Box::leak(
+                ps.iter()
+                    .map(|&partner| SourcePartner {
+                        partner,
+                        share_version: overrides
+                            .iter()
+                            .find(|(id, _)| *id == partner.project_id)
+                            .map(|&(_, n)| v(n)),
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ),
+            shamir_threshold: 2,
+            share_version: v(version),
+            legacy_manifest,
+            decrypt_signer_address: "0x1111111111111111111111111111111111111111",
+            zk_signer_address: "0x2222222222222222222222222222222222222222",
+        });
+        Box::leak(Box::new(env))
+    }
+
+    #[test]
+    fn manifest_names_carry_the_version() {
+        let e = env_with_versions(9, None);
+        assert_eq!(e.manifest_object(), "p/0/public-material.v9");
+        assert_eq!(e.legacy_manifest_object(), "p/0/public-material");
+    }
+
+    #[test]
+    fn a_source_partner_override_wins() {
+        let e = env_with_versions(9, Some((5, &[("p1", 8)], true)));
+        let r = e.reshare_from.as_ref().unwrap();
+        assert_eq!(r.version_for("p1").get(), 8);
+        assert_eq!(r.version_for("p2").get(), 5);
+        assert_eq!(r.manifest_object(e), "p/0/public-material");
+    }
+
+    #[test]
+    fn versions_must_climb() {
+        assert!(env_with_versions(5, Some((5, &[], false)))
+            .check_versions()
+            .is_err());
+        assert!(env_with_versions(8, Some((5, &[("p1", 8)], false)))
+            .check_versions()
+            .is_err());
+        assert!(env_with_versions(9, Some((5, &[("p1", 5)], false)))
+            .check_versions()
+            .is_err());
+        assert!(env_with_versions(9, Some((5, &[("p1", 8)], true)))
+            .check_versions()
+            .is_ok());
+    }
+
+    #[test]
+    fn every_baked_env_has_climbing_versions() {
+        for name in env_names() {
+            lookup(name).unwrap().check_versions().unwrap();
         }
     }
 
@@ -326,20 +474,25 @@ mod tests {
             ]
             .into_boxed_slice(),
         );
-        let source: &'static [EnvPartner] = Box::leak(
-            vec![
+        let source: &'static [SourcePartner] = Box::leak(
+            [
                 partner("real-1", "111111111111"),
                 partner("FILL-ME-PARTNER-3", "333333333333"),
             ]
-            .into_boxed_slice(),
+            .map(|partner| SourcePartner {
+                partner,
+                share_version: None,
+            })
+            .into(),
         );
         let mut env = env_with(target);
         env.reshare_from = Some(ReshareSource {
             partners: source,
             shamir_threshold: 2,
+            share_version: v(1),
+            legacy_manifest: false,
             decrypt_signer_address: "0x1111111111111111111111111111111111111111",
             zk_signer_address: "0x2222222222222222222222222222222222222222",
-            pins: &[],
         });
         let err = env
             .ensure_partners_complete()
