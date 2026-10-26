@@ -35,13 +35,9 @@ pub(crate) struct Config {
     pub(crate) threshold: u8,
     pub(crate) write_secret_fhe_priv: String,
     pub(crate) write_secret_zk_signer: String,
-    pub(crate) public_bucket: String,
-    // Prefix + security zone under which the public objects are laid out, matching
-    // cofhe's mounted key path (keys/versionized/{zone}/…), so a cofhe stack reads
-    // this ceremony's keyset directly.
-    pub(crate) public_prefix: String,
-    pub(crate) zone: u32,
-    // The baked env: every target partner gets both shares at its `share_version`.
+    // The baked env: every target partner gets both shares at its `share_version`,
+    // and a ceremony may replace a live keyset only when it bakes
+    // `replace_live_keyset`. The public bucket and its layout are read from it.
     pub(crate) env: &'static EnvConfig,
 }
 
@@ -69,7 +65,7 @@ impl Config {
     // N (shares) is the baked target partner count; T, the partner write
     // audiences, the reshare source, the public bucket and its layout are all
     // baked; the two partner secret ids are network-wide constants.
-    fn from_env_config(ec: &'static EnvConfig) -> Result<Self> {
+    pub(crate) fn from_env_config(ec: &'static EnvConfig) -> Result<Self> {
         // Fail before a single key is generated or read. A placeholder audience would
         // otherwise abort the run mid-write, after earlier partners are written.
         ec.ensure_partners_complete()?;
@@ -97,9 +93,6 @@ impl Config {
             partners,
             write_secret_fhe_priv: WRITE_SECRET_FHE_PRIV.to_string(),
             write_secret_zk_signer: WRITE_SECRET_ZK_SIGNER.to_string(),
-            public_bucket: ec.public_bucket.to_string(),
-            public_prefix: ec.public_prefix.to_string(),
-            zone: ec.public_zone,
             env: ec,
         };
         cfg.validate()?;
@@ -198,7 +191,9 @@ fn check_distinct<'a>(ids: impl Iterator<Item = &'a str>) -> Result<()> {
 mod tests {
     use super::*;
     use crate::test_support::*;
+    use crate::KEYGEN_READER;
     use cofhe_keys::envs::{v, EnvPartner};
+    use cofhe_keys::reader;
 
     fn partner(id: &str) -> PartnerCfg {
         PartnerCfg {
@@ -215,9 +210,6 @@ mod tests {
             threshold,
             write_secret_fhe_priv: "fhe".to_string(),
             write_secret_zk_signer: "zk".to_string(),
-            public_bucket: "bucket".to_string(),
-            public_prefix: "keys/versionized".to_string(),
-            zone: 0,
             env: cofhe_keys::envs::lookup("testnet").unwrap(),
         }
     }
@@ -240,9 +232,9 @@ mod tests {
             .ends_with("/providers/cofhe-tee-keygen-provider"));
         assert_eq!(cfg.write_secret_fhe_priv, "cofhe-tee-fhe-priv");
         assert_eq!(cfg.write_secret_zk_signer, "cofhe-tee-zk-signer");
-        assert_eq!(cfg.public_bucket, "localcofhenix");
-        assert_eq!(cfg.public_prefix, "generator/keys/versionized");
-        assert_eq!(cfg.zone, 0);
+        assert_eq!(cfg.env.public_bucket, "localcofhenix");
+        assert_eq!(cfg.env.public_prefix, "generator/keys/versionized");
+        assert_eq!(cfg.env.public_zone, 0);
     }
 
     #[test]
@@ -251,7 +243,7 @@ mod tests {
         assert_eq!(cfg.partners.len(), 3);
         assert_eq!(cfg.shares, 3);
         assert_eq!(cfg.threshold, 2);
-        assert_eq!(cfg.public_bucket, "fhenix-testnet-v2");
+        assert_eq!(cfg.env.public_bucket, "fhenix-testnet-v2");
     }
 
     #[test]
@@ -263,7 +255,7 @@ mod tests {
         assert_eq!(cfg.shares, 6);
         assert_eq!(cfg.threshold, 3);
         assert_eq!(cfg.partners[0].project_id, "fhenix-507307");
-        assert_eq!(cfg.public_bucket, "fhenix-mainnet-keys");
+        assert_eq!(cfg.env.public_bucket, "fhenix-mainnet-keys");
         for p in &cfg.partners {
             assert!(
                 p.wip_audience
@@ -349,6 +341,15 @@ mod tests {
         let ids: Vec<&str> = r.partners.iter().map(|s| s.partner.project_id).collect();
         assert_eq!(ids, ["p-1", "p-2", "p-3"]);
         assert_eq!(r.shamir_threshold, 2);
+        assert_eq!(
+            reader::partner_refs_for(
+                &r.partners.iter().map(|s| s.partner).collect::<Vec<_>>(),
+                KEYGEN_READER,
+                "s"
+            )[2]
+            .wip_audience,
+            "//iam.googleapis.com/projects/333333333333/locations/global/workloadIdentityPools/cofhe-tee-reader-pool/providers/keygen-reader"
+        );
         let targets: Vec<&str> = cfg.partners.iter().map(|p| p.project_id.as_str()).collect();
         assert_eq!(targets, ["p-1", "p-2", "p-4"]);
         assert_eq!(cfg.env.share_version.get(), 2);
