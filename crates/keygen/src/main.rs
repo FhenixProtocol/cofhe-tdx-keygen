@@ -19,9 +19,13 @@ use crate::gcp_auth::{GcpAuth, MetadataClient};
 #[cfg(not(feature = "mock"))]
 use anyhow::{bail, Context};
 #[cfg(not(feature = "mock"))]
+use cofhe_keys::envs::{EnvConfig, ReshareSource};
+#[cfg(not(feature = "mock"))]
 use cofhe_keys::serialization::{sha256, SecretEnvelope};
 #[cfg(not(feature = "mock"))]
 use cofhe_keys::{gcs::GcsClient, keygen, secrets::SecretManager};
+#[cfg(not(feature = "mock"))]
+use std::collections::BTreeSet;
 
 // Service endpoint constants — intentionally NOT read from the environment.
 // If an attacker with compute.instances.setMetadata could override these,
@@ -87,17 +91,22 @@ const WRITE_SECRET_FHE_PRIV: &str = "cofhe-tee-fhe-priv";
 #[cfg(not(feature = "mock"))]
 const WRITE_SECRET_ZK_SIGNER: &str = "cofhe-tee-zk-signer";
 
-// The ceremony shape is BAKED per environment (partners + their write audiences,
-// N/T, public bucket + layout) in `cofhe_keys::envs`, selected by `COFHE_ENV` — the
-// only operator-settable input besides `RUST_LOG`, and it is constrained to the
-// baked environments (fail-closed). Nothing here is settable via a VM metadata
-// override. `partners` is the partner set the Shamir shares are written to (share
-// i → partner i); `shares` (N) equals the partner count; `threshold` (T) is the
-// reconstruction threshold. Direct federated grant: each partner's attested
-// federated principal holds secretVersionAdder directly on its secrets, so there is
-// no service account to impersonate (no SA_EMAIL).
+// Which run this image does, from the baked env alone: an env with `reshare_from`
+// builds a reshare image, any other env a ceremony image. No runtime input can
+// change it.
+#[cfg(not(feature = "mock"))]
+enum Mode {
+    Ceremony,
+    Reshare(&'static ReshareSource),
+}
+
+// The run shape is baked per env in `cofhe_keys::envs`. Share i goes to
+// `partners[i]`; N = the partner count; T = `threshold`. No SA_EMAIL: each
+// partner's attested federated principal holds secretVersionAdder on its secrets
+// directly.
 #[cfg(not(feature = "mock"))]
 struct Config {
+    mode: Mode,
     partners: Vec<PartnerCfg>,
     shares: u8,
     threshold: u8,
@@ -113,10 +122,11 @@ struct Config {
 
 #[cfg(not(feature = "mock"))]
 impl Config {
-    // `COFHE_ENV` is the ONLY operator-settable ceremony input (besides `RUST_LOG`,
-    // honored by tracing) — it selects a BAKED environment and nothing else. Everything
-    // else is compiled in, so a VM metadata override cannot redirect the write set,
-    // weaken the threshold, or repoint the public bucket.
+    // `COFHE_ENV` is the ONLY operator-settable input (besides `RUST_LOG`, honored by
+    // tracing) — it selects a BAKED environment and nothing else. Everything else,
+    // the run mode and the recovery pins included, is compiled in, so a VM metadata
+    // override cannot redirect the write set, weaken the threshold, repoint the
+    // public bucket, or turn a reshare into a ceremony.
     fn from_env() -> Result<Self> {
         let env = std::env::var("COFHE_ENV").context(
             "env var COFHE_ENV not set (baked-environment selector: staging | testnet | mainnet)",
@@ -124,16 +134,36 @@ impl Config {
         Self::for_env(&env)
     }
 
-    // Build the ceremony config from a baked environment. Fails closed on any env not
-    // in `cofhe_keys::envs`' map (no default, no fallback). N (shares) is the baked
-    // partner count; T (threshold), the partner write audiences, the public bucket and
-    // its layout are all baked; the two partner secret ids are network-wide constants.
+    // Fails closed on any env not in `cofhe_keys::envs`' map (no default, no
+    // fallback).
     fn for_env(env: &str) -> Result<Self> {
         let ec = cofhe_keys::envs::lookup(env)?;
-        // Fail before a single key is generated. A placeholder audience would
-        // otherwise abort the run mid-ceremony, after earlier partners are written.
-        ec.ensure_partners_complete()
-            .with_context(|| format!("environment {env:?} cannot run a ceremony"))?;
+        Self::from_env_config(ec).with_context(|| format!("environment {env:?} cannot run"))
+    }
+
+    // N (shares) is the baked target partner count; T, the partner write
+    // audiences, the reshare source, the public bucket and its layout are all
+    // baked; the two partner secret ids are network-wide constants.
+    fn from_env_config(ec: &'static EnvConfig) -> Result<Self> {
+        // Fail before a single key is generated or read. A placeholder audience would
+        // otherwise abort the run mid-write, after earlier partners are written.
+        ec.ensure_partners_complete()?;
+        // The ceremony writes the manifest at `{prefix}/{zone}`; consumers read
+        // `public_object`. Both must name the same object.
+        let manifest = object_path(ec.public_prefix, ec.public_zone, OBJ_MANIFEST);
+        if ec.public_object != manifest {
+            bail!(
+                "public_object {:?} is not the manifest path {manifest:?}",
+                ec.public_object
+            );
+        }
+        let mode = match &ec.reshare_from {
+            None => Mode::Ceremony,
+            Some(_) if ec.replace_live_keyset => {
+                bail!("replace_live_keyset is set, but a reshare keeps the live keyset")
+            }
+            Some(src) => Mode::Reshare(src),
+        };
         let partners: Vec<PartnerCfg> = ec
             .partners
             .iter()
@@ -144,6 +174,7 @@ impl Config {
             .collect();
 
         let cfg = Config {
+            mode,
             shares: partners.len() as u8,
             threshold: ec.shamir_threshold,
             partners,
@@ -157,7 +188,7 @@ impl Config {
         Ok(cfg)
     }
 
-    // Fail-closed validation of the ceremony shape. The N-partners ↔ N-shares
+    // Fail-closed validation of the run shape. The N-partners ↔ N-shares
     // invariant (share i → partner i) and distinct partner ids are load-bearing:
     // the per-partner digest lists key by partner identity, so a duplicate id would
     // make two entries collide, and a count mismatch would leave a partner without a
@@ -173,14 +204,7 @@ impl Config {
                 self.partners.len()
             );
         }
-        if self.threshold < cofhe_keys::shamir::MIN_THRESHOLD || self.threshold > self.shares {
-            bail!(
-                "threshold T ({}) must satisfy {} <= T <= N ({})",
-                self.threshold,
-                cofhe_keys::shamir::MIN_THRESHOLD,
-                self.shares
-            );
-        }
+        check_threshold("threshold", self.threshold, self.shares as usize)?;
         for (i, p) in self.partners.iter().enumerate() {
             // Empty fields would mean a malformed baked env entry; reject at startup
             // rather than fail later with an opaque attestation/STS 403.
@@ -190,14 +214,93 @@ impl Config {
             if p.wip_audience.is_empty() {
                 bail!("baked partner {:?} has an empty wip_audience", p.project_id);
             }
-            for q in &self.partners[i + 1..] {
-                if p.project_id == q.project_id {
-                    bail!("duplicate baked partner project_id {:?}", p.project_id);
-                }
-            }
+        }
+        check_distinct(self.partners.iter().map(|p| p.project_id.as_str()))?;
+        if let Mode::Reshare(src) = self.mode {
+            self.validate_reshare(src)?;
         }
         Ok(())
     }
+
+    fn validate_reshare(&self, r: &ReshareSource) -> Result<()> {
+        check_threshold(
+            "reshare source threshold",
+            r.shamir_threshold,
+            r.partners.len(),
+        )?;
+        // An empty audience would fail later as an opaque STS 403, like a target's.
+        if r.partners
+            .iter()
+            .any(|s| s.project_id.is_empty() || s.wip_pool_audience.is_empty())
+        {
+            bail!("a reshare source partner has an empty project_id or wip_pool_audience");
+        }
+        check_distinct(r.partners.iter().map(|s| s.project_id)).context("reshare source")?;
+        for pin in r.pins {
+            if !r.partners.iter().any(|s| s.project_id == pin.project_id) {
+                bail!(
+                    "a reshare pin names {:?}, which is not a reshare source partner",
+                    pin.project_id
+                );
+            }
+            // A pin that names no version would read version 1, not the version it
+            // exists to name.
+            if pin.fhe_priv.is_none() && pin.zk_signer.is_none() {
+                bail!("the reshare pin for {:?} pins no version", pin.project_id);
+            }
+        }
+        check_distinct(r.pins.iter().map(|p| p.project_id)).context("reshare pins")?;
+        for (what, address) in [
+            ("decrypt_signer_address", r.decrypt_signer_address),
+            ("zk_signer_address", r.zk_signer_address),
+        ] {
+            let hex = address.strip_prefix("0x").unwrap_or_default();
+            if hex.len() != 40
+                || !hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                bail!("the reshare anchor {what} {address:?} is not a lowercase 0x-prefixed EVM address");
+            }
+        }
+        let source: BTreeSet<&str> = r.partners.iter().map(|s| s.project_id).collect();
+        let target: BTreeSet<&str> = self
+            .partners
+            .iter()
+            .map(|p| p.project_id.as_str())
+            .collect();
+        // Same set and same T is a no-op, except with pins: that cancels a reshare
+        // that stopped mid-write, by splitting the old set again from its old
+        // versions, so every partner's newest version is a share the manifest lists.
+        if source == target && r.shamir_threshold == self.threshold && r.pins.is_empty() {
+            bail!(
+                "the reshare source equals the target set with the same threshold: nothing to do"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "mock"))]
+fn check_threshold(what: &str, t: u8, n: usize) -> Result<()> {
+    if t < cofhe_keys::shamir::MIN_THRESHOLD || t as usize > n {
+        bail!(
+            "{what} T ({t}) must satisfy {} <= T <= N ({n})",
+            cofhe_keys::shamir::MIN_THRESHOLD
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "mock"))]
+fn check_distinct<'a>(ids: impl Iterator<Item = &'a str>) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for id in ids {
+        if !seen.insert(id) {
+            bail!("duplicate project_id {id:?}");
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -236,6 +339,18 @@ async fn main() -> Result<()> {
 #[cfg(not(feature = "mock"))]
 async fn real_boot() -> Result<()> {
     let cfg = Config::from_env()?;
+    if let Mode::Reshare(r) = cfg.mode {
+        for s in r.partners {
+            info!(partner = %s.project_id, fhe_priv_version = ?r.version_of(s.project_id, |p| p.fhe_priv), zk_signer_version = ?r.version_of(s.project_id, |p| p.zk_signer), "reshare source");
+        }
+        bail!(
+            "reshare image: this build validates a reshare config ({} sources, T={}, live signers {} and {}) but cannot run one",
+            r.partners.len(),
+            r.shamir_threshold,
+            r.decrypt_signer_address,
+            r.zk_signer_address
+        );
+    }
     info!(
         partners = cfg.partners.len(),
         shares = cfg.shares,
@@ -410,6 +525,8 @@ async fn write_secret(
 #[cfg(all(test, not(feature = "mock")))]
 mod tests {
     use super::*;
+    use cofhe_keys::envs::{EnvPartner, SourcePin};
+    use std::num::NonZeroU64;
 
     fn partner(id: &str) -> PartnerCfg {
         PartnerCfg {
@@ -420,6 +537,7 @@ mod tests {
 
     fn cfg(partners: Vec<PartnerCfg>, shares: u8, threshold: u8) -> Config {
         Config {
+            mode: Mode::Ceremony,
             partners,
             shares,
             threshold,
@@ -545,5 +663,254 @@ mod tests {
         cfg(vec![partner("a"), partner("b")], 2, 2)
             .validate()
             .unwrap();
+    }
+
+    // ---- reshare mode -------------------------------------------------------
+
+    fn env_partner(id: &'static str, num: &'static str) -> EnvPartner {
+        EnvPartner {
+            project_id: id,
+            wip_pool_audience: Box::leak(
+                format!("//iam.googleapis.com/projects/{num}/locations/global/workloadIdentityPools/cofhe-tee-reader-pool")
+                    .into_boxed_str(),
+            ),
+            keygen_write_audience: Box::leak(
+                format!("//iam.googleapis.com/projects/{num}/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider")
+                    .into_boxed_str(),
+            ),
+        }
+    }
+
+    fn set(ids: &[(&'static str, &'static str)]) -> &'static [EnvPartner] {
+        Box::leak(
+            ids.iter()
+                .map(|(id, n)| env_partner(id, n))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+    }
+
+    const P1: (&str, &str) = ("p-1", "111111111111");
+    const P2: (&str, &str) = ("p-2", "222222222222");
+    const P3: (&str, &str) = ("p-3", "333333333333");
+    const P4: (&str, &str) = ("p-4", "444444444444");
+
+    const LIVE_DECRYPT: &str = "0x1111111111111111111111111111111111111111";
+    const LIVE_ZK: &str = "0x2222222222222222222222222222222222222222";
+
+    fn env(
+        target: &'static [EnvPartner],
+        t: u8,
+        source: Option<(&'static [EnvPartner], u8)>,
+    ) -> &'static EnvConfig {
+        Box::leak(Box::new(EnvConfig {
+            partners: target,
+            public_bucket: "b",
+            public_object: "p/0/public-material",
+            public_prefix: "p",
+            public_zone: 0,
+            shamir_threshold: t,
+            reshare_from: source.map(|(partners, shamir_threshold)| ReshareSource {
+                partners,
+                shamir_threshold,
+                decrypt_signer_address: LIVE_DECRYPT,
+                zk_signer_address: LIVE_ZK,
+                pins: &[],
+            }),
+            replace_live_keyset: false,
+        }))
+    }
+
+    // 2-of-3 on p1..p3 → 2-of-3 on p1, p2, p4: replace p3 with p4.
+    fn replace_env() -> &'static EnvConfig {
+        env(set(&[P1, P2, P4]), 2, Some((set(&[P1, P2, P3]), 2)))
+    }
+
+    #[test]
+    fn reshare_builds_source_and_target_sets() {
+        let cfg = Config::from_env_config(replace_env()).unwrap();
+        let Mode::Reshare(r) = &cfg.mode else {
+            panic!("expected reshare mode")
+        };
+        let ids: Vec<&str> = r.partners.iter().map(|s| s.project_id).collect();
+        assert_eq!(ids, ["p-1", "p-2", "p-3"]);
+        assert_eq!(r.shamir_threshold, 2);
+        let targets: Vec<&str> = cfg.partners.iter().map(|p| p.project_id.as_str()).collect();
+        assert_eq!(targets, ["p-1", "p-2", "p-4"]);
+        assert!(r.pins.is_empty());
+    }
+
+    // An env without a reshare source builds a ceremony image.
+    #[test]
+    fn mode_comes_from_the_baked_env() {
+        let plain = env(set(&[P1, P2, P3]), 2, None);
+        assert!(matches!(
+            Config::from_env_config(plain).unwrap().mode,
+            Mode::Ceremony
+        ));
+    }
+
+    // A reshare keeps the live keyset, so the replace flag on a reshare env is a
+    // baked mistake.
+    #[test]
+    fn replace_live_keyset_is_refused_on_a_reshare() {
+        let src = replace_env().reshare_from.as_ref().unwrap();
+        let e = Box::leak(Box::new(EnvConfig {
+            replace_live_keyset: true,
+            reshare_from: Some(ReshareSource { ..*src }),
+            ..*replace_env()
+        }));
+        assert!(Config::from_env_config(e).is_err());
+    }
+
+    fn with_pins(pins: &'static [SourcePin]) -> &'static EnvConfig {
+        let src = replace_env().reshare_from.as_ref().unwrap();
+        Box::leak(Box::new(EnvConfig {
+            reshare_from: Some(ReshareSource { pins, ..*src }),
+            ..*replace_env()
+        }))
+    }
+
+    // A pin applies to the one partner and secret it names; everything else has none.
+    #[test]
+    fn reshare_pins_default_to_none() {
+        let e = with_pins(Box::leak(Box::new([SourcePin {
+            project_id: "p-1",
+            fhe_priv: NonZeroU64::new(3),
+            zk_signer: None,
+        }])));
+        let cfg = Config::from_env_config(e).unwrap();
+        let Mode::Reshare(r) = cfg.mode else {
+            panic!("expected reshare mode")
+        };
+        let v = |id, pick: fn(&SourcePin) -> Option<NonZeroU64>| r.version_of(id, pick);
+        assert_eq!(v("p-1", |p| p.fhe_priv), NonZeroU64::new(3));
+        assert_eq!(v("p-1", |p| p.zk_signer), None);
+        assert_eq!(v("p-2", |p| p.fhe_priv), None);
+    }
+
+    #[test]
+    fn bad_pins_fail_closed() {
+        let pin = |id: &'static str, fhe: u64| SourcePin {
+            project_id: id,
+            fhe_priv: NonZeroU64::new(fhe),
+            zk_signer: None,
+        };
+        for pins in [
+            vec![pin("p-4", 3)],
+            vec![pin("nobody", 3)],
+            vec![pin("p-1", 3), pin("p-1", 4)],
+            vec![pin("p-1", 0)],
+        ] {
+            let pins: &'static [SourcePin] = Box::leak(pins.into_boxed_slice());
+            assert!(Config::from_env_config(with_pins(pins)).is_err());
+        }
+    }
+
+    // The baked anchor pins the live keyset by its public signer addresses. A
+    // malformed anchor must stop the build of the config, not the run.
+    #[test]
+    fn reshare_requires_a_well_formed_live_anchor() {
+        for bad in [
+            "",
+            "0x",
+            "11",
+            "0x1111",
+            &format!("0x{}", "G".repeat(40)),
+            &format!("0x{}", "AB".repeat(20)),
+        ] {
+            let bad: &'static str = Box::leak(bad.to_string().into_boxed_str());
+            for (decrypt, zk) in [(bad, LIVE_ZK), (LIVE_DECRYPT, bad)] {
+                let e = Box::leak(Box::new(EnvConfig {
+                    reshare_from: Some(ReshareSource {
+                        partners: set(&[P1, P2, P3]),
+                        shamir_threshold: 2,
+                        decrypt_signer_address: decrypt,
+                        zk_signer_address: zk,
+                        pins: &[],
+                    }),
+                    ..*env(set(&[P1, P2, P4]), 2, None)
+                }));
+                assert!(
+                    Config::from_env_config(e).is_err(),
+                    "anchor ({decrypt:?}, {zk:?}) must fail closed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reshare_rejects_a_no_op() {
+        let same = env(set(&[P1, P2, P3]), 2, Some((set(&[P3, P2, P1]), 2)));
+        assert!(Config::from_env_config(same).is_err());
+        // Same set with a new T is a real change.
+        let new_t = env(set(&[P1, P2, P3]), 3, Some((set(&[P1, P2, P3]), 2)));
+        assert!(Config::from_env_config(new_t).is_ok());
+        // Same set and T with pins cancels a stopped reshare: allowed.
+        let cancel = Box::leak(Box::new(EnvConfig {
+            reshare_from: Some(ReshareSource {
+                pins: Box::leak(Box::new([SourcePin {
+                    project_id: "p-1",
+                    fhe_priv: NonZeroU64::new(1),
+                    zk_signer: NonZeroU64::new(1),
+                }])),
+                ..*same.reshare_from.as_ref().unwrap()
+            }),
+            ..*env(set(&[P1, P2, P3]), 2, None)
+        }));
+        assert!(Config::from_env_config(cancel).is_ok());
+    }
+
+    #[test]
+    fn reshare_validates_the_source_set() {
+        let empty = env(set(&[P1, P2]), 2, Some((set(&[]), 2)));
+        assert!(Config::from_env_config(empty).is_err());
+        let dup = env(set(&[P1, P2]), 2, Some((set(&[P1, P1, P3]), 2)));
+        assert!(Config::from_env_config(dup).is_err());
+        let t_high = env(set(&[P1, P2]), 2, Some((set(&[P1, P3]), 3)));
+        assert!(Config::from_env_config(t_high).is_err());
+        let t_low = env(set(&[P1, P2]), 2, Some((set(&[P1, P3]), 1)));
+        assert!(Config::from_env_config(t_low).is_err());
+        let src: &'static [EnvPartner] = Box::leak(Box::new([
+            env_partner(P1.0, P1.1),
+            EnvPartner {
+                project_id: "p-9",
+                wip_pool_audience: "",
+                keygen_write_audience: "",
+            },
+        ]));
+        let empty_audience = env(set(&[P1, P2]), 2, Some((src, 2)));
+        assert!(Config::from_env_config(empty_audience).is_err());
+    }
+
+    // The run writes the manifest at `{prefix}/{zone}`, and consumers read
+    // `public_object`. An env where they differ is refused, so the replace guard
+    // always checks the object consumers read.
+    #[test]
+    fn public_object_must_be_the_manifest_path() {
+        let e = Box::leak(Box::new(EnvConfig {
+            public_object: "p/1/public-material",
+            reshare_from: None,
+            ..*env(set(&[P1, P2, P3]), 2, None)
+        }));
+        assert!(Config::from_env_config(e).is_err());
+    }
+
+    // The CI gate for baked config: every baked env with a complete partner set must
+    // build. Each env runs exactly one mode by construction, so a bad reshare source
+    // or pin fails CI and never reaches a release. A declared but unfilled partner
+    // slot fails on purpose.
+    #[test]
+    fn every_baked_env_validates() {
+        for name in cofhe_keys::envs::env_names() {
+            let env = cofhe_keys::envs::lookup(name).unwrap();
+            let cfg = Config::for_env(name);
+            assert_eq!(
+                cfg.is_ok(),
+                env.ensure_partners_complete().is_ok(),
+                "env {name:?}: {:?}",
+                cfg.err().map(|e| format!("{e:#}"))
+            );
+        }
     }
 }

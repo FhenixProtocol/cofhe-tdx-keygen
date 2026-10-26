@@ -448,6 +448,8 @@ mod tests {
             public_prefix: "p",
             public_zone: 0,
             shamir_threshold: 2,
+            reshare_from: None,
+            replace_live_keyset: false,
         };
         let env = &fixture;
         // `PartnerRef` is deliberately not `Debug`, so match rather than `expect_err`.
