@@ -36,7 +36,15 @@ Invariants — do not break these (see `DESIGN.md` for the rationale behind each
   only splits it again. Both are all-or-nothing.
 - The baked env decides the run, with no runtime input: an env with
   `reshare_from` builds a reshare-only image, and any other env a ceremony-only
-  image.
+  image. A ceremony refuses to run while any object exists under the
+  `public-material` prefix (the legacy name or any `.v{N}`), unless the env bakes
+  `replace_live_keyset: true`.
+- Unity versions: every partner holds a keyset's shares at the baked
+  `share_version`, and every read names that exact number. There is no `latest`.
+  Each version has its own manifest, `public-material.v{N}`.
+- The write path and its recovery are in `CEREMONY.md` (§2 Step 4 and §5).
+- Never delete a secret version, a manifest or a pinned image. Recovery and rollback
+  depend on them.
 
 Writing docs and comments: active voice, present tense, one idea per sentence,
 simple words. State operator cautions as instructions, not alarms. Never claim an

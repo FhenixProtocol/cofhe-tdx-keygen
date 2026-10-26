@@ -81,7 +81,7 @@ Each run generates one keyset, split by destination.
 |----------|----------|-------------|------|
 | **Secret share** | FHE ClientKey (`priv`) + decrypt-signer + zk-signer private scalars | partner Secret Manager | ~40 KB |
 | **Public artifacts** | ServerKey, CompactPublicKey, CRS — one `safe_serialize`d object each | our GCS bucket, `keys/versionized/{zone}/{computation_key,public_key,crs}` | ~33 MB |
-| **Public manifest** | both signer EVM addresses + SHA-256 digests of each artifact and each split secret | our GCS bucket, `.../public-material` (+ `.provenance`) | ~1 KB |
+| **Public manifest** | both signer EVM addresses + SHA-256 digests of each artifact and each split secret | our GCS bucket, `.../public-material.v{N}` (+ `.provenance`), one per share version | ~1 KB |
 
 Secret Manager's 64 KiB per-secret limit forces the secret/public split: the share
 fits, and the artifacts do not (ServerKey alone is ~30 MB). The public artifacts are
@@ -91,8 +91,11 @@ therefore live in one shared bucket in our project, not in each partner's projec
 We write them as **separate objects**, under cofhe's own key file names
 (`computation_key`, `public_key`, `crs`) in `keys/versionized/{zone}/`. A cofhe stack
 pointed at the bucket then mounts this ceremony's keyset directly as files. The small
-`public-material` **manifest** beside them carries only the signer addresses and the
-SHA-256 digests, of each artifact and each split secret. A consumer that reads an
+`public-material.v{N}` **manifest** beside them carries only the signer addresses and the
+SHA-256 digests, of each artifact and each split secret. `N` is the baked
+`share_version`. Each version has its own manifest, and none is deleted, because a
+reader at vN checks its shares against the vN digests. The artifacts are not versioned:
+a reshare never changes them. A consumer that reads an
 artifact file checks it against the manifest digest, so artifact integrity rests on the
 manifest. The bucket's write IAM protects the manifest itself (§7).
 
@@ -114,8 +117,12 @@ it.
 granted **directly** to the attested federated principal, a `principalSet` scoped by
 `gce_project_id`. There is no intermediate service account to impersonate, and
 therefore no standing credential that could leak. The only key to the vault is a fresh
-attestation of exactly what code is running. The role is "add a version", never
+attestation of exactly what code is running. The write role is "add a version", never
 "access", so the enclave can deliver new material but cannot read existing material.
+The one read is a reshare that a partner approves (§5, §10). `secretVersionAdder`
+cannot list versions, so in the write window the same principal also holds
+`roles/secretmanager.viewer` on both secrets. It sees version numbers and states,
+never a payload.
 
 > The alternative we rejected was an intermediate writer service account for the
 > enclave to impersonate. It adds a standing credential and buys nothing.
@@ -131,11 +138,56 @@ anchors reconstruction validation and liar attribution on the read side.
 **All-or-nothing (write side).** Generate the full keyset first, split it, then write
 each partner their share. **Any** partner write that fails crashes the whole run, so no
 partial ceremony is ever advertised: the public material is published only after every
-write succeeds. Each run is a fresh keyset, and runs append a new Secret Manager version
+write succeeds. Each ceremony is a fresh keyset, and runs append a new Secret Manager version
 (history is retained, and consumers read one exact, baked version; there is no
-`latest`). Read-side reconstruction is the
+`latest`). Every partner holds the shares at the same number, the baked
+`share_version`, so one number names one keyset split everywhere. Secret Manager does
+not let a writer choose the number, so the run pads with filler versions that are
+not envelopes, and a read of one fails closed. The precheck runs before any write,
+so a bad target stops the run with nothing written. There is no retry: a retried add
+could create a second version. `CEREMONY.md` §2 Step 4 gives the write path.
+Read-side reconstruction is the
 opposite. It is **fault-tolerant**: a hung or lying partner is excluded, and
 reconstruction proceeds from any T good shares.
+
+### Reshare: a new partner set, the same keyset
+
+A reshare changes who holds the shares. It does not change the keys. The FHE
+ClientKey, both signers, the public artifacts and the signer addresses stay the same.
+Only the shares and the per-share digests in the manifest change.
+
+- **Source and target are baked.** `EnvConfig.reshare_from` holds the partner set that
+  holds the live shares, its threshold, and the two live signer addresses. The run
+  refuses a manifest that names other signers, so a bucket writer cannot swap in an
+  older keyset for the run to split again. `partners` and `shamir_threshold` are the
+  target. Consumers read only the target, so a consumer needs a rebuild and no code
+  change. Remove `reshare_from` after the run.
+- **The env decides the run.** An env with `reshare_from` builds a reshare-only image,
+  and any other env a ceremony-only image. No runtime input selects the mode. A
+  ceremony over a live manifest needs a baked `replace_live_keyset`, so an image built
+  from the wrong env cannot replace the live keyset (`CEREMONY.md` §2 Step 4). A CI
+  test builds every baked env.
+- **The read.** The enclave attests at each source partner's `keygen-reader` provider
+  and reads both secrets. It needs only the old threshold of good shares, so a partner
+  that leaves and does not set the read flag does not block the run. The rebuilt
+  secrets must match the live full-key digests.
+- **The live-key check.** Before the first write, the enclave checks the published
+  artifact digests and the signer addresses, and runs the coherence test with the
+  published CompactPublicKey and ServerKey and the rebuilt ClientKey, plus one
+  homomorphic add. The public artifacts cannot be regenerated byte for byte (their
+  keygen is randomized), so this check is how a reshare proves it holds the live key.
+- **The write.** A fresh split for the target set, written at the target
+  `share_version` M by the ceremony write path. The source version N and its
+  manifest stay, so old and new consumers run side by side during the roll.
+- **One run per change.** A rerun of a finished reshare stops at the precheck,
+  because every partner is already at the target. The full key exists in one
+  enclave for the length of the run, as in a ceremony, and dies with the VM.
+- **Recovery and rollback** work because a run never touches version N or
+  `public-material.v{N}`, and never reuses or deletes a number or a manifest.
+  `CEREMONY.md` §5 gives the steps.
+- **Not a revocation.** An old share is still a valid point of the same key. The new
+  manifest stops honest readers from using it, but T old holders who collude can
+  still rebuild the key. A suspected leak needs a new ceremony, not a reshare.
 
 ## 6. Attestation and access control
 
@@ -255,7 +307,9 @@ consumer-side work that remains.
 - **No standing credential.** A fresh attestation of the measured image is the only
   thing that unlocks a write. There is nothing on disk to steal.
 - **Append-only.** The enclave holds `secretVersionAdder`, not `secretAccessor`, so it
-  cannot read existing key material.
+  cannot read existing key material. The one exception is a reshare (§5): a partner
+  that sets `grant_reshare_read` gives the pinned keygen image `secretAccessor` on its
+  two secrets, for that run only. The flag defaults to `false`.
 - **No encrypt-to-partner-key.** The partner's own GCP IAM and Secret Manager
   encryption-at-rest protect the secret material. A partner admin with `secretAccessor`
   can read it, so the confidentiality boundary is the partner's IAM.
@@ -343,7 +397,10 @@ now passes the partner's digest-pinned attested-reader gate.
 | No encrypt-to-partner-key | Confidentiality rests on the partner's IAM; keeps the design simple |
 | Versions, not new secrets | History retained; consumers read an exact version, never `latest`; no name churn per run |
 | Stamp provenance, do not consume it | The token stays in the wire format for compatibility; the write-gate and bucket IAM carry integrity (§7) |
-| Fresh keys, all-or-nothing | No persistence/resume; any partner failure crashes the run |
+| Ceremony: fresh keys, all-or-nothing | No persistence/resume; any partner failure crashes the run. A rerun after a share write needs a higher `share_version` (§5). |
+| Reshare re-splits the live keyset | Changes the partner set without a new keyset or new signers on-chain. Proactive resharing without a rebuild needs compute at each source partner, and partners hold only secrets. |
+| Unity versions: one baked number per keyset | Every partner holds the shares at the same number, and every reader reads it exactly (§5). Each version has its own manifest, so old and new readers overlap during a roll. |
+| The env decides the run | No runtime input selects ceremony or reshare, or sets a version. A ceremony over a live keyset needs a baked `replace_live_keyset`. |
 | Digest-pin the partner CEL (production) | Partner explicitly approves each exact image via TF apply; only that digest can write. Re-apply per image rotation is intended (explicit per-image consent), not a cost. Chosen over Cosign-fingerprint pinning, which is looser ("anything our key signs"). |
 | Keyless SLSA provenance, checked at pin time | Provenance gates nothing at *runtime* under a digest pin, so it gates the *pin* instead. Each build attests the digest keylessly (OIDC → Fulcio → public Rekor, plus GitHub's public attestation API); the partner asserts digest + commit + repo + workflow + `refs/heads/main` before approving the digest. Keyless, so there is no Fhenix key to trust or rotate. See §13. |
 | TLS 1.3 + X25519MLKEM768 only, fail-closed | Key shares must resist harvest-now-decrypt-later; only the ML-KEM hybrid addresses it. aws-lc-rs provider (rustls's default; ring has no ML-KEM, graviola too young for key material; leaving rustls would put a C TLS stack in the distroless image). Enforcement lives in the clients (`cofhe_keys::tls`), so consumers inherit it on rev bump with no config. Cost: aws-lc-sys needs cmake at build time. |
@@ -361,6 +418,8 @@ now passes the partner's digest-pinned attested-reader gate.
   consumer-side `allowed_image_digests` mirror was removed (§7) — so rotation touches
   the partners only, not the consumers. Development leaves it unpinned by default, for
   iteration speed.
+- **Reader overlap:** each attested reader lists 1 or 2 digests, so old and new
+  images overlap during a roll; the tag A and B steps are in `CEREMONY.md` §5.
 
 ## 13. Image build and the production gate
 
@@ -416,7 +475,7 @@ Four layers, cheapest first. The first three run on a laptop with no cloud.
 
 1. **Static gates**, on every change, in `.github/workflows/ci.yml`: `cargo fmt --check`,
    `cargo clippy --workspace --all-targets -D warnings`, a release build of the
-   workspace, and a `--no-default-features` build of the writer-only image profile, which
+   workspace, and a `--no-default-features` build of the image profile, which
    is what the enclave ships. CI also runs `scripts/check-tf-reader-drift.sh`, which fails
    if the Terraform public-material map and the baked map in `cofhe-keys` disagree — the
    two are duplicated by necessity, so a drift check replaces trust.
@@ -426,7 +485,12 @@ Four layers, cheapest first. The first three run on a laptop with no cloud.
    below 2; the reader gathers from a mock Secret Manager and GCS, excludes a liar by
    per-share digest and **names** it, excludes a hung partner on timeout, and fails closed
    on a full-key digest mismatch; and one slow test generates the real tfhe keyset and
-   asserts each share fits Secret Manager's 64 KiB cap.
+   asserts each share fits Secret Manager's 64 KiB cap. For the reshare, a mocked run
+   (GCS, Secret Manager, STS, metadata and the attestation socket) proves the key is
+   checked before any write, and a ceremony stops over a live manifest.
+   The tests marked `#[ignore]` generate a real keyset: the whole reshare, its stops,
+   the old and new readers, and the staging migration. CI skips them. Run them with
+   `cargo test -p keygen -- --ignored` before a release that changes the reshare path.
 3. **A mock run** (`make run-local`) runs the real `generate()` end to end on a laptop,
    with no attestation and no writes.
 4. **The cloud round-trip** is the acceptance gate before a production deploy, because it

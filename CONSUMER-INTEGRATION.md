@@ -29,8 +29,15 @@ Shamir job: they gather every partner's share fault-tolerantly, filter liars by
 per-share digest fail-closed, reconstruct from T, validate against the published full
 digest, and return the typed component. (`read_public` reads the public material.)
 Each takes `version_of`, the exact Secret Manager version to read per partner. There is
-no `latest`: a consumer passes its baked version, and a filler at that version fails
-closed because it is not an envelope.
+no `latest`, and a filler at that version fails closed because it is not an envelope.
+A consumer reads the manifest of the same version (`public-material.v{N}`):
+
+- set `ReaderContext.public_object = env.manifest_object()`;
+- read with `read_fhe_priv(&ctx, &accesses, t, &|_| env.share_version)` (the same
+  for `read_zk_signer`).
+
+`EnvConfig::public_object` is gone, so a consumer gets a compile break on the bump.
+Deploy a unity consumer only after its env has that manifest.
 
 ---
 
@@ -87,11 +94,10 @@ is in the `partner-onboarding` module in
 secret. There is no unpinned fallback, so **rotating a consumer image requires a
 partner re-apply with the new digest and its `source_sha`**. Both come from the build
 run's summary, and the partner's apply fails without the commit — every attested reader
-must name the commit its image was built from. That is explicit per-image consent, the same as
-the keygen write pin. The module pins **one** digest per consumer, so the moment a
-partner re-applies, the old image loses read access there. A running instance keeps
-serving from memory, but it could no longer boot, so keep the gap between the re-pin and
-the roll short. The onboarding input is the module's `attested_readers` map; see
+must name the commit its image was built from. That is explicit per-image consent, the
+same as the keygen write pin. Each consumer lists 1 or 2 digests, so old and new images
+overlap during a roll; the tag A and B steps are in `CEREMONY.md` §5.
+The onboarding input is the module's `attested_readers` map; see
 `partner/modules/partner-onboarding/README.md` in
 [`key-share-holders`](https://github.com/FhenixProtocol/key-share-holders).
 
@@ -124,7 +130,7 @@ compute-project pin refuses even a wrong-env pick at the partner.
 
 > **Rebuild triggers.** Onboarding a new env (adding its triplet) and changing a
 > partner *set* within an env are code changes → consumer rebuild → new digests →
-> partner re-apply. A same-set re-share needs no rebuild.
+> partner re-apply. Every reshare also needs a rebuild: it raises `share_version`.
 
 **Division of labour:** the consumer owns its identity and its image rotation. We own
 the wire format, the gather, the reconstruction and the validation. A consumer must not
@@ -187,5 +193,11 @@ that fails crashes the run, so no half-finished ceremony is ever advertised. The
 is fault-tolerant: a hung, stale or lying partner is excluded and logged, and
 reconstruction proceeds from any T good shares.
 
-**Live key rotation is future work.** Today a re-run appends a fresh keyset as a new
-version across all partners.
+**A reshare changes the partner set, not the key.** After a reshare, rebuild with the
+new `cofhe-keys` so the baked set is the new target set. The key, the signers and the
+public artifacts stay the same. A share from a removed partner, or an old version at a
+staying partner, fails its per-share digest and is excluded.
+
+**A ceremony re-run over a live keyset is refused.** Only an env that bakes
+`replace_live_keyset: true` writes a new keyset, and that invalidates existing
+ciphertexts.
