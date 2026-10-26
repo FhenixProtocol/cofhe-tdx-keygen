@@ -43,8 +43,8 @@ use crate::shamir;
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 // The baked environment source (`EnvPartner`, `EnvConfig`, `env_names`, `lookup`)
-// lives in the unconditional `crate::envs` module so the write-only enclave image
-// can resolve its env without the reader stack. Re-exported here so existing
+// lives in the unconditional `crate::envs` module so every feature set resolves
+// its env. Re-exported here so existing
 // `cofhe_keys::reader::{…}` consumer paths are unchanged.
 pub use crate::envs::{env_names, lookup, EnvConfig, EnvPartner};
 
@@ -70,15 +70,25 @@ pub struct PartnerRef {
 pub fn partner_refs(env: &EnvConfig, consumer: &str, secret_id: &str) -> Result<Vec<PartnerRef>> {
     env.ensure_partners_complete()
         .context("refusing to build partner references")?;
-    Ok(env
-        .partners
+    Ok(partner_refs_for(env.partners, consumer, secret_id))
+}
+
+/// [`partner_refs`] for a partner slice other than an env's target set, such as
+/// the source set of a reshare. The caller gates the slice for placeholder slots:
+/// `EnvConfig::ensure_partners_complete` covers the reshare source too.
+pub fn partner_refs_for(
+    partners: &[EnvPartner],
+    consumer: &str,
+    secret_id: &str,
+) -> Vec<PartnerRef> {
+    partners
         .iter()
         .map(|p| PartnerRef {
             project_id: p.project_id.to_string(),
             secret_id: secret_id.to_string(),
             wip_audience: format!("{}/providers/{consumer}-reader", p.wip_pool_audience),
         })
-        .collect())
+        .collect()
 }
 
 /// One partner + the caller-obtained SM bearer for THAT partner. SM tokens are

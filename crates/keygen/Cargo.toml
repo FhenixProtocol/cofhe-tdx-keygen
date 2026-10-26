@@ -18,25 +18,26 @@ path = "src/bin/verify.rs"
 required-features = ["verify"]
 
 # Tooling-only: prints the baked per-env public-material map as JSON for the CI
-# TF↔reader drift check. Needs the reader side (behind `verify`), so it is skipped
-# in the image build (`--bin keygen --no-default-features`) where reader is absent.
+# TF↔reader drift check. Built only with `verify`, so the image build
+# (`--bin keygen --no-default-features`) skips it.
 [[example]]
 name = "emit_public_material"
 required-features = ["verify"]
 
 [features]
 # Default keeps `verify` so plain `cargo build`/`cargo test` build the acceptance
-# CLI; the enclave image builds `--bin keygen --no-default-features` to leave the
-# read path (Secret Manager / GCS fetch + reconstruct) out of the write-side TCB.
+# CLI; the enclave image builds `--bin keygen --no-default-features`. The image
+# carries the read path (Secret Manager / GCS fetch + reconstruct) because a
+# reshare reads the live shares; partners grant that read only per reshare.
 default = ["verify"]
 # Local-dev only: skip the TDX attestation + Secret Manager chain and generate
 # keys in-process so the service runs without GCP/TDX. Never ship.
 mock = []
-# The `verify` acceptance CLI; pulls the `cofhe-keys` read/verify side.
-verify = ["cofhe-keys/reader"]
+# Builds the `verify` acceptance CLI.
+verify = []
 
 [dependencies]
-cofhe-keys = { path = "../cofhe-keys", default-features = false, features = ["writer"] }
+cofhe-keys = { path = "../cofhe-keys", default-features = false, features = ["writer", "reader"] }
 anyhow = "1"
 hex = "0.4"
 # Same feature rationale as cofhe-keys: no bundled provider/roots — the ring
@@ -49,5 +50,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 [dev-dependencies]
+base64 = "0.22"
 tempfile = "3"
 wiremock = "0.6"

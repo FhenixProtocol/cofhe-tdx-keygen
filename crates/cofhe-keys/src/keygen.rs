@@ -113,7 +113,7 @@ fn fhe_config() -> tfhe::Config {
 ///
 /// Builds the [`FhePrivShare`] (FHE priv + decrypt signer → TeeCryptor) and
 /// [`ZkSignerShare`] (zk signer → ZK verifier) exactly as a single-partner run
-/// would, then splits each one's canonical bytes into `shares` blobs (T-of-N,
+/// would, then splits each one's canonical bytes into one blob per partner (T-of-N,
 /// `threshold`) with a fresh OS-seeded CSPRNG. Share `i` of each secret is paired
 /// with `partner_ids[i]` (index → identity), so the returned `Vec<PartnerShares>`
 /// is index-aligned to `partner_ids` and ready for per-partner distribution.
@@ -124,21 +124,12 @@ fn fhe_config() -> tfhe::Config {
 /// consumer can drop a tampered/stale partner's share UP FRONT (plain Shamir does
 /// not error-correct).
 ///
-/// `partner_ids.len()` must equal `shares` (N partners ↔ N shares), and the ids
-/// must be distinct; [`split_for_partners`] checks both.
+/// N is `partner_ids.len()`, and the ids must be distinct; [`split_for_partners`]
+/// checks them.
 pub fn generate(
     partner_ids: &[String],
-    shares: u8,
     threshold: u8,
 ) -> Result<(Vec<PartnerShares>, PublicArtifacts, PublicMaterial)> {
-    if partner_ids.len() != shares as usize {
-        bail!(
-            "generate: {} partner ids but {} shares (must be equal)",
-            partner_ids.len(),
-            shares
-        );
-    }
-
     let config = fhe_config();
 
     info!("keygen: generating FHE ClientKey (priv)");
@@ -525,7 +516,7 @@ mod tests {
 
         // generate() also runs the coherence self-test internally; reaching here
         // means encrypt → expand → decrypt round-tripped.
-        let (partner_shares, artifacts, public) = generate(&partner_ids, n, t).unwrap();
+        let (partner_shares, artifacts, public) = generate(&partner_ids, t).unwrap();
         assert_eq!(partner_shares.len(), n as usize);
 
         // The per-partner digest lists are populated, length N, keyed by the given

@@ -31,17 +31,12 @@ pub(crate) enum Mode {
 pub(crate) struct Config {
     pub(crate) mode: Mode,
     pub(crate) partners: Vec<PartnerCfg>,
-    pub(crate) shares: u8,
     pub(crate) threshold: u8,
     pub(crate) write_secret_fhe_priv: String,
     pub(crate) write_secret_zk_signer: String,
-    pub(crate) public_bucket: String,
-    // Prefix + security zone under which the public objects are laid out, matching
-    // cofhe's mounted key path (keys/versionized/{zone}/…), so a cofhe stack reads
-    // this ceremony's keyset directly.
-    pub(crate) public_prefix: String,
-    pub(crate) zone: u32,
-    // The baked env: every target partner gets both shares at its `share_version`.
+    // The baked env: every target partner gets both shares at its `share_version`,
+    // and a ceremony may replace a live keyset only when it bakes
+    // `replace_live_keyset`. The public bucket and its layout are read from it.
     pub(crate) env: &'static EnvConfig,
 }
 
@@ -66,10 +61,10 @@ impl Config {
         Self::from_env_config(ec).with_context(|| format!("environment {env:?} cannot run"))
     }
 
-    // N (shares) is the baked target partner count; T, the partner write
+    // N is the baked target partner count; T, the partner write
     // audiences, the reshare source, the public bucket and its layout are all
     // baked; the two partner secret ids are network-wide constants.
-    fn from_env_config(ec: &'static EnvConfig) -> Result<Self> {
+    pub(crate) fn from_env_config(ec: &'static EnvConfig) -> Result<Self> {
         // Fail before a single key is generated or read. A placeholder audience would
         // otherwise abort the run mid-write, after earlier partners are written.
         ec.ensure_partners_complete()?;
@@ -92,37 +87,25 @@ impl Config {
 
         let cfg = Config {
             mode,
-            shares: partners.len() as u8,
             threshold: ec.shamir_threshold,
             partners,
             write_secret_fhe_priv: WRITE_SECRET_FHE_PRIV.to_string(),
             write_secret_zk_signer: WRITE_SECRET_ZK_SIGNER.to_string(),
-            public_bucket: ec.public_bucket.to_string(),
-            public_prefix: ec.public_prefix.to_string(),
-            zone: ec.public_zone,
             env: ec,
         };
         cfg.validate()?;
         Ok(cfg)
     }
 
-    // Fail-closed validation of the run shape. The N-partners ↔ N-shares
-    // invariant (share i → partner i) and distinct partner ids are load-bearing:
-    // the per-partner digest lists key by partner identity, so a duplicate id would
-    // make two entries collide, and a count mismatch would leave a partner without a
-    // share (or a share without a home). These now guard the baked env config.
+    // Fail-closed validation of the run shape. Distinct partner ids are
+    // load-bearing: the per-partner digest lists key by partner identity, so a
+    // duplicate id would make two entries collide. N is the partner count, so a
+    // share count cannot disagree with it.
     fn validate(&self) -> Result<()> {
         if self.partners.is_empty() {
             bail!("baked environment lists no partners");
         }
-        if self.partners.len() != self.shares as usize {
-            bail!(
-                "share count ({}) must equal the partner count ({}): one share per partner",
-                self.shares,
-                self.partners.len()
-            );
-        }
-        check_threshold("threshold", self.threshold, self.shares as usize)?;
+        check_threshold("threshold", self.threshold, self.partners.len())?;
         for (i, p) in self.partners.iter().enumerate() {
             // Empty fields would mean a malformed baked env entry; reject at startup
             // rather than fail later with an opaque attestation/STS 403.
@@ -198,7 +181,9 @@ fn check_distinct<'a>(ids: impl Iterator<Item = &'a str>) -> Result<()> {
 mod tests {
     use super::*;
     use crate::test_support::*;
+    use crate::KEYGEN_READER;
     use cofhe_keys::envs::{v, EnvPartner};
+    use cofhe_keys::reader;
 
     fn partner(id: &str) -> PartnerCfg {
         PartnerCfg {
@@ -207,17 +192,13 @@ mod tests {
         }
     }
 
-    fn cfg(partners: Vec<PartnerCfg>, shares: u8, threshold: u8) -> Config {
+    fn cfg(partners: Vec<PartnerCfg>, threshold: u8) -> Config {
         Config {
             mode: Mode::Ceremony,
             partners,
-            shares,
             threshold,
             write_secret_fhe_priv: "fhe".to_string(),
             write_secret_zk_signer: "zk".to_string(),
-            public_bucket: "bucket".to_string(),
-            public_prefix: "keys/versionized".to_string(),
-            zone: 0,
             env: cofhe_keys::envs::lookup("testnet").unwrap(),
         }
     }
@@ -229,7 +210,6 @@ mod tests {
     fn builds_staging_from_baked_env() {
         let cfg = Config::for_env("staging").unwrap();
         assert_eq!(cfg.partners.len(), 5);
-        assert_eq!(cfg.shares, 5);
         assert_eq!(cfg.threshold, 2);
         assert_eq!(cfg.partners[0].project_id, "cofhe-tee-partner-1");
         assert!(cfg.partners[0]
@@ -240,18 +220,17 @@ mod tests {
             .ends_with("/providers/cofhe-tee-keygen-provider"));
         assert_eq!(cfg.write_secret_fhe_priv, "cofhe-tee-fhe-priv");
         assert_eq!(cfg.write_secret_zk_signer, "cofhe-tee-zk-signer");
-        assert_eq!(cfg.public_bucket, "localcofhenix");
-        assert_eq!(cfg.public_prefix, "generator/keys/versionized");
-        assert_eq!(cfg.zone, 0);
+        assert_eq!(cfg.env.public_bucket, "localcofhenix");
+        assert_eq!(cfg.env.public_prefix, "generator/keys/versionized");
+        assert_eq!(cfg.env.public_zone, 0);
     }
 
     #[test]
     fn builds_testnet_from_baked_env() {
         let cfg = Config::for_env("testnet").unwrap();
         assert_eq!(cfg.partners.len(), 3);
-        assert_eq!(cfg.shares, 3);
         assert_eq!(cfg.threshold, 2);
-        assert_eq!(cfg.public_bucket, "fhenix-testnet-v2");
+        assert_eq!(cfg.env.public_bucket, "fhenix-testnet-v2");
     }
 
     #[test]
@@ -260,10 +239,9 @@ mod tests {
     fn builds_mainnet_from_baked_env() {
         let cfg = Config::for_env("mainnet").expect("the mainnet partner set is complete");
         assert_eq!(cfg.partners.len(), 6);
-        assert_eq!(cfg.shares, 6);
         assert_eq!(cfg.threshold, 3);
         assert_eq!(cfg.partners[0].project_id, "fhenix-507307");
-        assert_eq!(cfg.public_bucket, "fhenix-mainnet-keys");
+        assert_eq!(cfg.env.public_bucket, "fhenix-mainnet-keys");
         for p in &cfg.partners {
             assert!(
                 p.wip_audience
@@ -284,58 +262,50 @@ mod tests {
 
     #[test]
     fn rejects_empty_partners() {
-        assert!(cfg(vec![], 0, 0).validate().is_err());
-    }
-
-    #[test]
-    fn rejects_partner_count_share_mismatch() {
-        let partners = (0..3).map(|i| partner(&format!("p{i}"))).collect();
-        assert!(cfg(partners, 5, 2).validate().is_err());
+        assert!(cfg(vec![], 0).validate().is_err());
     }
 
     #[test]
     fn rejects_duplicate_project_ids() {
         let partners = vec![partner("dup"), partner("p1"), partner("dup")];
-        assert!(cfg(partners, 3, 2).validate().is_err());
+        assert!(cfg(partners, 2).validate().is_err());
     }
 
     #[test]
     fn rejects_empty_wip_audience() {
         let mut partners: Vec<PartnerCfg> = (0..5).map(|i| partner(&format!("p{i}"))).collect();
         partners[2].wip_audience = String::new();
-        assert!(cfg(partners, 5, 2).validate().is_err());
+        assert!(cfg(partners, 2).validate().is_err());
     }
 
     #[test]
     fn rejects_empty_project_id() {
         let mut partners: Vec<PartnerCfg> = (0..5).map(|i| partner(&format!("p{i}"))).collect();
         partners[0].project_id = String::new();
-        assert!(cfg(partners, 5, 2).validate().is_err());
+        assert!(cfg(partners, 2).validate().is_err());
     }
 
     #[test]
     fn rejects_threshold_above_shares() {
         let partners = (0..5).map(|i| partner(&format!("p{i}"))).collect();
-        assert!(cfg(partners, 5, 6).validate().is_err());
+        assert!(cfg(partners, 6).validate().is_err());
     }
 
     #[test]
     fn rejects_zero_threshold() {
         let partners = (0..5).map(|i| partner(&format!("p{i}"))).collect();
-        assert!(cfg(partners, 5, 0).validate().is_err());
+        assert!(cfg(partners, 0).validate().is_err());
     }
 
     #[test]
     fn rejects_single_partner() {
         // T = N = 1 is no longer valid: Gf256::combine_array needs >= 2 shares.
-        assert!(cfg(vec![partner("solo")], 1, 1).validate().is_err());
+        assert!(cfg(vec![partner("solo")], 1).validate().is_err());
     }
 
     #[test]
     fn accepts_minimum_two_of_two() {
-        cfg(vec![partner("a"), partner("b")], 2, 2)
-            .validate()
-            .unwrap();
+        cfg(vec![partner("a"), partner("b")], 2).validate().unwrap();
     }
 
     // ---- reshare mode -------------------------------------------------------
@@ -349,6 +319,15 @@ mod tests {
         let ids: Vec<&str> = r.partners.iter().map(|s| s.partner.project_id).collect();
         assert_eq!(ids, ["p-1", "p-2", "p-3"]);
         assert_eq!(r.shamir_threshold, 2);
+        assert_eq!(
+            reader::partner_refs_for(
+                &r.partners.iter().map(|s| s.partner).collect::<Vec<_>>(),
+                KEYGEN_READER,
+                "s"
+            )[2]
+            .wip_audience,
+            "//iam.googleapis.com/projects/333333333333/locations/global/workloadIdentityPools/cofhe-tee-reader-pool/providers/keygen-reader"
+        );
         let targets: Vec<&str> = cfg.partners.iter().map(|p| p.project_id.as_str()).collect();
         assert_eq!(targets, ["p-1", "p-2", "p-4"]);
         assert_eq!(cfg.env.share_version.get(), 2);

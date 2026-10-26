@@ -33,11 +33,12 @@ variable "run_ceremony" {
   type    = bool
   default = false
   # Gates the one-shot keygen VM. Default false: a routine apply of the standing
-  # infra (IAM + the public-bucket write grant) leaves the VM absent and never
-  # regenerates the keyset. Set true ONLY to deliberately run a ceremony (which
-  # generates a NEW keyset and overwrites the partner shares + public material),
-  # then set back to false to tear the VM down. See CEREMONY.md Step 4.
-  description = "When true, create the one-shot TDX keygen VM and run a ceremony. Keep false for routine infra applies."
+  # infra (IAM + the public-bucket write grant) leaves the VM absent. Set true ONLY
+  # to run the pinned image once: a ceremony image writes a new keyset, a reshare
+  # image splits the live one again (the baked env decides). Then set back to
+  # false to tear the VM down. A rerun needs false then true again: the VM runs its
+  # container only once. See CEREMONY.md.
+  description = "When true, create the one-shot TDX keygen VM and run the pinned image once (a ceremony or a reshare, as its baked env decides). Keep false for routine infra applies."
 }
 
 variable "public_material_anonymous_read" {
