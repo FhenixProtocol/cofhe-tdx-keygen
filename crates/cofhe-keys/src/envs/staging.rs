@@ -31,10 +31,42 @@ pub(super) const PARTNERS: &[EnvPartner] = &[
 pub(super) const STAGING: EnvConfig = EnvConfig {
     partners: PARTNERS,
     public_bucket: "localcofhenix",
-    public_object: "generator/keys/versionized/0/public-material",
     public_prefix: "generator/keys/versionized",
     public_zone: 0,
     shamir_threshold: 2,
-    reshare_from: None,
+    share_version: v(9),
+    // The migration to share versions: partner-1 holds v8 and partners 2-5 hold
+    // v5, all listed by the legacy unversioned manifest. The source entries index
+    // `PARTNERS` only because this migration keeps the same set. For a set change,
+    // write them in full: an edit of `PARTNERS` would change them too.
+    reshare_from: Some(ReshareSource {
+        partners: &[
+            SourcePartner {
+                partner: PARTNERS[0],
+                share_version: Some(v(8)),
+            },
+            SourcePartner {
+                partner: PARTNERS[1],
+                share_version: None,
+            },
+            SourcePartner {
+                partner: PARTNERS[2],
+                share_version: None,
+            },
+            SourcePartner {
+                partner: PARTNERS[3],
+                share_version: None,
+            },
+            SourcePartner {
+                partner: PARTNERS[4],
+                share_version: None,
+            },
+        ],
+        shamir_threshold: 2,
+        share_version: v(5),
+        legacy_manifest: true,
+        decrypt_signer_address: "0x78727a198308732baadd7db5339ed95d50110b76",
+        zk_signer_address: "0xe12a73f5aaca9ae79bda8754a485fe99fef3fac3",
+    }),
     replace_live_keyset: false,
 };

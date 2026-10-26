@@ -47,24 +47,22 @@ pub(super) const PARTNERS: &[EnvPartner] = &[
 /// ownership, or a guarantee of third-party independence, off these strings.
 ///
 /// Changing the partner set is NOT a config change. It is: put the current set in
-/// `reshare_from`, edit the entries below to the new set, rebuild every consumer
-/// (the source is compile-time), re-pin the new consumer digests in the env's
-/// `keygen-partners` var-file, have the partners re-apply the partner stack, and
-/// run a reshare. Deploy the rebuilt consumers only after the reshare writes the
-/// new shares: they read the new set only. Then remove `reshare_from`. Plan for
-/// that sequence — there is no shortcut that skips the rebuild.
+/// `reshare_from`, edit the entries below to the new set, raise `share_version`,
+/// and run a reshare. CEREMONY.md §5 gives the full sequence, with tags A and B.
+/// For a set change, write the source entries in full in `reshare_from`, not as
+/// `PARTNERS[i]`: an edit of `PARTNERS` to the target set would change them too.
 pub(super) const MAINNET: EnvConfig = EnvConfig {
     partners: PARTNERS,
-    // This is the single source of truth for the mainnet public location;
-    // public_object = "{public_prefix}/{public_zone}/public-material". terraform/service
+    // This is the single source of truth for the mainnet public location; the
+    // manifest is EnvConfig::manifest_object(). terraform/service
     // mirrors public_bucket + public_prefix in local.public_material only to scope the
     // read grant's IAM condition, and CI (check-tf-reader-drift.sh) enforces the match —
     // the ceremony lays out the path from what is baked here.
     public_bucket: "fhenix-mainnet-keys",
-    public_object: "generator/keys/versionized/0/public-material",
     public_prefix: "generator/keys/versionized",
     public_zone: 0,
     shamir_threshold: 3,
+    share_version: v(1),
     reshare_from: None,
     replace_live_keyset: false,
 };
