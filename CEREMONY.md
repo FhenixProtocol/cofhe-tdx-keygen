@@ -57,7 +57,7 @@ call with no attestation hop.
 
 One share goes to each partner, and a threshold of shares reconstructs the secret. The
 partner count (N) and threshold (T) are baked per environment in
-`crates/cofhe-keys/src/envs.rs`. The threshold is always at least 2, because the Shamir
+`crates/cofhe-keys/src/envs/`. The threshold is always at least 2, because the Shamir
 backend has no meaningful single-share case.
 
 ---
