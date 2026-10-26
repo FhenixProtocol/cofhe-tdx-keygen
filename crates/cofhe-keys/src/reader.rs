@@ -90,15 +90,15 @@ pub struct PartnerAccess<'a> {
     pub sm_token: &'a str,
 }
 
-/// Read one partner's secret envelope at one exact version and return its version
-/// resource name with its **payload bytes** (one audience component's canonical
-/// bytes). A filler at that version is not an envelope, so it fails closed here.
+/// Read one partner's secret envelope at one exact version and return its
+/// **payload bytes** (one audience component's canonical bytes). A filler at that
+/// version is not an envelope, so it fails closed here.
 async fn read_share_at(
     sm: &SecretManager,
     sm_token: &str,
     partner: &PartnerRef,
     version: NonZeroU64,
-) -> Result<(String, Vec<u8>)> {
+) -> Result<Vec<u8>> {
     let (name, raw) = sm
         .access_version(sm_token, &partner.project_id, &partner.secret_id, version)
         .await
@@ -111,7 +111,7 @@ async fn read_share_at(
     tracing::info!(partner = %partner.project_id, version = %name, "read share");
     let envelope = SecretEnvelope::from_canonical_bytes(raw.as_slice())
         .with_context(|| format!("decode envelope {name} for partner {}", partner.project_id))?;
-    Ok((name, envelope.payload))
+    Ok(envelope.payload)
 }
 
 /// Read the public material from our bucket and return its bytes. Integrity rests
@@ -163,7 +163,7 @@ async fn fetch_all(
     let mut failed = Vec::new();
     for (project_id, res) in results {
         match res {
-            Ok((_, share)) => successes.push((project_id, share)),
+            Ok(share) => successes.push((project_id, share)),
             Err(e) => {
                 tracing::warn!(partner = %project_id, error = %e, "partner fetch/verify failed; excluding");
                 failed.push(project_id);
@@ -500,7 +500,7 @@ mod tests {
             secret_id: "cofhe-tee-fhe-priv".to_string(),
             wip_audience: String::new(),
         };
-        let (_, got) = read_share_at(&sm, "sm-tok", &partner, NonZeroU64::MIN)
+        let got = read_share_at(&sm, "sm-tok", &partner, TEST_VERSION)
             .await
             .unwrap();
         assert_eq!(got, payload);
