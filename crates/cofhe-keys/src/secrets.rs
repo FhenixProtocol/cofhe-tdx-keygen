@@ -119,43 +119,23 @@ mod tests {
         let encoded = STANDARD.encode(raw);
         Mock::given(method("GET"))
             .and(path(
-                "/v1/projects/test-project/secrets/k1/versions/1:access",
+                "/v1/projects/test-project/secrets/k1/versions/7:access",
             ))
             .and(header("authorization", "Bearer sa-xyz"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "name": "projects/.../secrets/k1/versions/1",
+                "name": "projects/123/secrets/k1/versions/7",
                 "payload": { "data": encoded }
             })))
             .mount(&server)
             .await;
 
         let sm = SecretManager::new(server.uri());
-        let (_, bytes) = sm
-            .access_version("sa-xyz", "test-project", "k1", NonZeroU64::MIN)
-            .await
-            .unwrap();
-        assert_eq!(bytes.as_slice(), raw);
-    }
-
-    #[tokio::test]
-    async fn access_version_reads_explicit_version_and_returns_name() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/projects/p/secrets/s/versions/7:access"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "name": "projects/123/secrets/s/versions/7",
-                "payload": { "data": STANDARD.encode(b"hi") }
-            })))
-            .mount(&server)
-            .await;
-
-        let sm = SecretManager::new(server.uri());
         let (name, bytes) = sm
-            .access_version("t", "p", "s", NonZeroU64::new(7).unwrap())
+            .access_version("sa-xyz", "test-project", "k1", NonZeroU64::new(7).unwrap())
             .await
             .unwrap();
-        assert_eq!(name, "projects/123/secrets/s/versions/7");
-        assert_eq!(bytes.as_slice(), b"hi");
+        assert_eq!(name, "projects/123/secrets/k1/versions/7");
+        assert_eq!(bytes.as_slice(), raw);
     }
 
     #[tokio::test]
