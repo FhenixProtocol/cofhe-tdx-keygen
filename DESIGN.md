@@ -33,7 +33,7 @@ It is a one-shot program: boot → attest → generate → distribute → exit.
 
 **Threshold / N>1 Shamir split — done.** Each secret splits into one share per partner,
 and a threshold of shares reconstructs it. The partner count (N) and threshold (T) are
-baked per environment in `crates/cofhe-keys/src/envs.rs`. The write loop is "broadcast
+baked per environment in `crates/cofhe-keys/src/envs/`. The write loop is "broadcast
 public + per-partner share", and the reader gathers, reconstructs and validates
 fault-tolerantly. Proven end-to-end on real Confidential Space (§14).
 
@@ -123,7 +123,7 @@ attestation of exactly what code is running. The role is "add a version", never
 **Shamir N-of-T split.** Each secret payload splits into one share per partner, and a
 threshold of shares reconstructs it. No single partner holds the whole secret. The
 primitive lives in `crates/cofhe-keys/src/shamir.rs`, and N and T are baked per
-environment in `envs.rs`. The threshold has a hard floor of 2: the Shamir backend cannot
+environment in `envs/`. The threshold has a hard floor of 2: the Shamir backend cannot
 reconstruct from a single share, so the degenerate T=1 case is unsupported and rejected.
 The public material carries a per-share digest list keyed by partner `project_id`, which
 anchors reconstruction validation and liar attribution on the read side.
