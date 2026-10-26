@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::Client;
 use serde::Deserialize;
+use std::num::NonZeroU64;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -18,6 +19,7 @@ pub struct SecretManager {
 
 #[derive(Deserialize)]
 struct AccessResponse {
+    name: String,
     payload: Payload,
 }
 
@@ -39,17 +41,19 @@ impl SecretManager {
         }
     }
 
-    // Read path: used by the consumer `reader` to fetch a partner's secret
-    // envelope (the keygen write path itself never reads).
-    pub async fn access(
+    /// Read one exact version of a secret; there is no `latest`. Secret Manager
+    /// numbers versions from 1, so a zero version cannot be expressed. Returns the
+    /// version resource name with the payload.
+    pub async fn access_version(
         &self,
         access_token: &str,
         project_id: &str,
         secret_name: &str,
-    ) -> Result<Zeroizing<Vec<u8>>> {
+        version: NonZeroU64,
+    ) -> Result<(String, Zeroizing<Vec<u8>>)> {
         let url = format!(
-            "{}/v1/projects/{}/secrets/{}/versions/latest:access",
-            self.base_url, project_id, secret_name
+            "{}/v1/projects/{}/secrets/{}/versions/{}:access",
+            self.base_url, project_id, secret_name, version
         );
         let resp = self
             .http
@@ -67,14 +71,10 @@ impl SecretManager {
         let decoded = STANDARD
             .decode(parsed.payload.data)
             .context("base64 decode")?;
-        Ok(Zeroizing::new(decoded))
+        Ok((parsed.name, Zeroizing::new(decoded)))
     }
 
-    /// Add a new version to an existing secret (Secret Manager `addVersion`).
-    /// This is the cross-project WRITE counterpart to `access`: the keygen
-    /// enclave impersonates the partner's writer SA and pushes the generated
-    /// key bytes as a new version into the partner's Secret Manager.
-    /// Returns the created version's resource name.
+    /// Add a version with the caller's federated token; returns the version resource name.
     pub async fn add_version(
         &self,
         access_token: &str,
@@ -108,6 +108,7 @@ impl SecretManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TEST_VERSION;
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -118,7 +119,7 @@ mod tests {
         let encoded = STANDARD.encode(raw);
         Mock::given(method("GET"))
             .and(path(
-                "/v1/projects/test-project/secrets/k1/versions/latest:access",
+                "/v1/projects/test-project/secrets/k1/versions/1:access",
             ))
             .and(header("authorization", "Bearer sa-xyz"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -129,8 +130,32 @@ mod tests {
             .await;
 
         let sm = SecretManager::new(server.uri());
-        let bytes = sm.access("sa-xyz", "test-project", "k1").await.unwrap();
+        let (_, bytes) = sm
+            .access_version("sa-xyz", "test-project", "k1", NonZeroU64::MIN)
+            .await
+            .unwrap();
         assert_eq!(bytes.as_slice(), raw);
+    }
+
+    #[tokio::test]
+    async fn access_version_reads_explicit_version_and_returns_name() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/projects/p/secrets/s/versions/7:access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "projects/123/secrets/s/versions/7",
+                "payload": { "data": STANDARD.encode(b"hi") }
+            })))
+            .mount(&server)
+            .await;
+
+        let sm = SecretManager::new(server.uri());
+        let (name, bytes) = sm
+            .access_version("t", "p", "s", NonZeroU64::new(7).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(name, "projects/123/secrets/s/versions/7");
+        assert_eq!(bytes.as_slice(), b"hi");
     }
 
     #[tokio::test]
@@ -141,7 +166,10 @@ mod tests {
             .mount(&server)
             .await;
         let sm = SecretManager::new(server.uri());
-        assert!(sm.access("t", "p", "n").await.is_err());
+        assert!(sm
+            .access_version("t", "p", "n", TEST_VERSION)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
