@@ -132,7 +132,8 @@ anchors reconstruction validation and liar attribution on the read side.
 each partner their share. **Any** partner write that fails crashes the whole run, so no
 partial ceremony is ever advertised: the public material is published only after every
 write succeeds. Each run is a fresh keyset, and runs append a new Secret Manager version
-(history is retained, and consumers read `latest`). Read-side reconstruction is the
+(history is retained, and consumers read one exact, baked version; there is no
+`latest`). Read-side reconstruction is the
 opposite. It is **fault-tolerant**: a hung or lying partner is excluded, and
 reconstruction proceeds from any T good shares.
 
@@ -236,11 +237,10 @@ They cannot drift, because they are the same code.
 `read_fhe_priv` and `read_zk_signer` do the whole job: they gather every partner's share
 fault-tolerantly (`fetch_all`, with a per-partner timeout), then call
 `reconstruct_and_validate` (per-share digest filter → reconstruct from T → full-key
-digest check). `read_share` is the single-secret unit, and `read_public` downloads and
-checks the public material. The reader is auth-agnostic: the caller passes tokens it
-obtained with its own identity, so the library carries no attestation or write
-machinery. The `verify reconstruct` CLI is a thin wrapper over these entry points, for
-operator round-trips.
+digest check). `read_public` downloads and checks the public material. The reader is
+auth-agnostic: the caller passes tokens it obtained with its own identity, so the
+library carries no attestation or write machinery. The `verify reconstruct` CLI is a
+thin wrapper over these entry points, for operator round-trips.
 
 We write **two per-audience secrets** per partner, so that IAM enforces least privilege:
 `cofhe-tee-fhe-priv` (FHE priv + decrypt signer → TeeCryptor) and `cofhe-tee-zk-signer`
@@ -341,7 +341,7 @@ now passes the partner's digest-pinned attested-reader gate.
 | Direct federated grant | No service account, no impersonation, no leakable standing credential |
 | Public material in our bucket | Identical for all, not secret, consumed by compute; partners read only their share |
 | No encrypt-to-partner-key | Confidentiality rests on the partner's IAM; keeps the design simple |
-| Versions, not new secrets | History retained; consumers read `latest`; no name churn per run |
+| Versions, not new secrets | History retained; consumers read an exact version, never `latest`; no name churn per run |
 | Stamp provenance, do not consume it | The token stays in the wire format for compatibility; the write-gate and bucket IAM carry integrity (§7) |
 | Fresh keys, all-or-nothing | No persistence/resume; any partner failure crashes the run |
 | Digest-pin the partner CEL (production) | Partner explicitly approves each exact image via TF apply; only that digest can write. Re-apply per image rotation is intended (explicit per-image consent), not a cost. Chosen over Cosign-fingerprint pinning, which is looser ("anything our key signs"). |

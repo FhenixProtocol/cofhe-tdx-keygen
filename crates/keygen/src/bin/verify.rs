@@ -1,12 +1,12 @@
 //! Manual acceptance tool: read a partner's `SecretEnvelope` from Secret Manager
-//! and check the secret's payload against the published digest in the public
-//! material (the reconstruction anchor a consumer validates against). Doubles as
-//! the round-trip validator for a real run.
+//! and check the secret's payload (one Shamir share) against that partner's
+//! per-share digest in the public material. `verify reconstruct` checks the full
+//! key. Doubles as the round-trip validator for a real run.
 //!
 //! Each per-audience secret is checked independently (run once per secret):
-//!   verify --project cofhe-tee-partner-1 --secret cofhe-tee-fhe-priv \
+//!   verify --project cofhe-tee-partner-1 --secret cofhe-tee-fhe-priv --version <N> \
 //!     --token "$(gcloud auth print-access-token)" \
-//!     --bucket <name> --public-object keys/versionized/0/public-material
+//!     --bucket <name> --public-object <manifest of version N>
 
 use anyhow::{bail, Context, Result};
 use cofhe_keys::gcs::GcsClient;
@@ -15,6 +15,7 @@ use cofhe_keys::reader::{
 };
 use cofhe_keys::secrets::SecretManager;
 use cofhe_keys::serialization::{self, SecretEnvelope};
+use std::num::NonZeroU64;
 
 const SM_URL: &str = "https://secretmanager.googleapis.com";
 const GCS_URL: &str = "https://storage.googleapis.com";
@@ -22,6 +23,7 @@ const GCS_URL: &str = "https://storage.googleapis.com";
 struct Args {
     project: String,
     secret: String,
+    version: NonZeroU64,
     token: String,
     sm_url: String,
     bucket: Option<String>,
@@ -31,10 +33,11 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: verify --project <p> --secret <s> --token <access_token> \\\n  \
-         [--bucket <name>] [--public-object <name>] [--sm-url <url>] [--gcs-url <url>]\n\n\
-         Reads the secret envelope and, with --bucket, checks its payload against\n\
-         the published fhe_priv_digest / zk_signer_digest in the public material."
+        "usage: verify --project <p> --secret <s> --version <N> --token <access_token> \\\n  \
+         --public-object <name> [--bucket <name>] [--sm-url <url>] [--gcs-url <url>]\n\n\
+         Reads the secret envelope at version N (there is no latest) and, with\n\
+         --bucket, checks its payload (one share) against the per-share digest\n\
+         published for --project in --public-object, the manifest of that version."
     );
     std::process::exit(2);
 }
@@ -68,10 +71,11 @@ fn parse_args() -> Result<Args> {
     let argv: Vec<String> = std::env::args().collect();
     let mut project = None;
     let mut secret = None;
+    let mut version = None;
     let mut token = None;
     let mut sm_url = SM_URL.to_string();
     let mut bucket = None;
-    let mut public_object = "keys/versionized/0/public-material".to_string();
+    let mut public_object = None;
     let mut gcs_url = GCS_URL.to_string();
 
     let mut i = 1;
@@ -79,10 +83,11 @@ fn parse_args() -> Result<Args> {
         match argv[i].as_str() {
             "--project" => project = Some(req_val(&argv, i)?),
             "--secret" => secret = Some(req_val(&argv, i)?),
+            "--version" => version = Some(req_val(&argv, i)?.parse().context("--version")?),
             "--token" => token = Some(req_val(&argv, i)?),
             "--sm-url" => sm_url = req_val(&argv, i)?,
             "--bucket" => bucket = Some(req_val(&argv, i)?),
-            "--public-object" => public_object = req_val(&argv, i)?,
+            "--public-object" => public_object = Some(req_val(&argv, i)?),
             "--gcs-url" => gcs_url = req_val(&argv, i)?,
             "-h" | "--help" => usage(),
             other => bail!("unknown argument: {}", other),
@@ -93,10 +98,11 @@ fn parse_args() -> Result<Args> {
     Ok(Args {
         project: project.context("--project is required")?,
         secret: secret.context("--secret is required")?,
+        version: version.context("--version is required")?,
         token: token.context("--token is required")?,
         sm_url: require_https("--sm-url", sm_url)?,
         bucket,
-        public_object,
+        public_object: public_object.context("--public-object is required")?,
         gcs_url: require_https("--gcs-url", gcs_url)?,
     })
 }
@@ -119,8 +125,8 @@ async fn main() -> Result<()> {
     let args = parse_args()?;
 
     let sm = SecretManager::new(&args.sm_url);
-    let raw = sm
-        .access(&args.token, &args.project, &args.secret)
+    let (_, raw) = sm
+        .access_version(&args.token, &args.project, &args.secret, args.version)
         .await
         .context("read envelope from Secret Manager")?;
     let envelope =
@@ -131,8 +137,8 @@ async fn main() -> Result<()> {
         hex::encode(hash)
     );
 
-    // With --bucket, check the payload against the published per-secret digest —
-    // the reconstruction anchor a consumer validates against.
+    // With --bucket, check the payload against this partner's published per-share
+    // digest, the same liar filter a consumer runs.
     if let Some(bucket) = &args.bucket {
         let gcs = GcsClient::new(&args.gcs_url);
         let public_material = gcs
@@ -141,16 +147,74 @@ async fn main() -> Result<()> {
             .context("download public material")?;
         let public = serialization::PublicMaterial::from_canonical_bytes(&public_material)
             .context("decode public material")?;
-        if hash == public.fhe_priv_digest {
-            println!("OK  published fhe_priv_digest matches this secret's payload");
-        } else if hash == public.zk_signer_digest {
-            println!("OK  published zk_signer_digest matches this secret's payload");
-        } else {
-            bail!("this secret's payload matches NEITHER published digest in the public material");
-        }
+        let matched = published_digest_for(&public, &args.project, &hash)?;
+        println!(
+            "OK  {project}'s entry in the published {matched} matches this secret's payload",
+            project = args.project
+        );
     }
 
     Ok(())
+}
+
+// One secret version holds one Shamir share, never the full key, so it matches
+// only its own partner's entry in a per-share digest list. The full-key digests
+// are checked by `verify reconstruct`.
+fn published_digest_for(
+    public: &serialization::PublicMaterial,
+    project: &str,
+    hash: &[u8; 32],
+) -> Result<&'static str> {
+    for (label, digests) in [
+        ("fhe_priv_share_digests", &public.fhe_priv_share_digests),
+        ("zk_signer_share_digests", &public.zk_signer_share_digests),
+    ] {
+        if digests.iter().any(|(id, d)| id == project && d == hash) {
+            return Ok(label);
+        }
+    }
+    bail!("this secret's payload matches NEITHER per-share digest published for partner {project}");
+}
+
+#[cfg(test)]
+mod share_digest_tests {
+    use super::published_digest_for;
+    use cofhe_keys::serialization::PublicMaterial;
+
+    fn manifest() -> PublicMaterial {
+        PublicMaterial {
+            server_key_digest: [0; 32],
+            compact_public_key_digest: [0; 32],
+            crs_digest: [0; 32],
+            decrypt_signer_address: String::new(),
+            zk_signer_address: String::new(),
+            fhe_priv_digest: [1; 32],
+            zk_signer_digest: [2; 32],
+            fhe_priv_share_digests: vec![("p-1".into(), [11; 32]), ("p-2".into(), [12; 32])],
+            zk_signer_share_digests: vec![("p-1".into(), [21; 32]), ("p-2".into(), [22; 32])],
+        }
+    }
+
+    #[test]
+    fn a_correct_share_matches_its_partner_digest() {
+        let m = manifest();
+        assert_eq!(
+            published_digest_for(&m, "p-2", &[12; 32]).unwrap(),
+            "fhe_priv_share_digests"
+        );
+        assert_eq!(
+            published_digest_for(&m, "p-1", &[21; 32]).unwrap(),
+            "zk_signer_share_digests"
+        );
+    }
+
+    #[test]
+    fn a_wrong_payload_fails() {
+        let m = manifest();
+        assert!(published_digest_for(&m, "p-1", &[9; 32]).is_err());
+        // Another partner's share is not this partner's share.
+        assert!(published_digest_for(&m, "p-1", &[12; 32]).is_err());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +241,7 @@ fn operator_access<'a>(refs: &'a [PartnerRef], token: &'a str) -> Vec<PartnerAcc
 struct ReconArgs {
     env: String,
     threshold: u8,
+    version: NonZeroU64,
     token: String,
     // Optional operator OVERRIDES: default to the baked env source. An
     // explicit flag still wins, for testing against an ad-hoc bucket/object.
@@ -191,7 +256,7 @@ struct ReconArgs {
 fn recon_usage() -> ! {
     eprintln!(
         "usage: verify reconstruct --env <staging|testnet|mainnet> --threshold <T> \\\n  \
-         --token <access_token> \\\n  \
+         --version <N> --token <access_token> \\\n  \
          [--bucket <name>] [--public-object <name>] \\\n  \
          [--secret-fhe-priv <s>] [--secret-zk-signer <s>] \\\n  \
          [--sm-url <url>] [--gcs-url <url>]\n\n\
@@ -199,8 +264,9 @@ fn recon_usage() -> ! {
          environment — --env selects them and fails closed on anything\n\
          else. --bucket / --public-object are optional OVERRIDES for testing against\n\
          an ad-hoc location; omitted, they default to the baked env source. Fetches\n\
-         each partner's share, reconstructs both secrets from T good shares, and\n\
-         validates them against the published full digests."
+         each partner's share at version N (there is no latest), reconstructs both\n\
+         secrets from T good shares, and validates them against the published full\n\
+         digests."
     );
     std::process::exit(2);
 }
@@ -208,6 +274,7 @@ fn recon_usage() -> ! {
 fn parse_reconstruct_args(argv: &[String]) -> Result<ReconArgs> {
     let mut env = None;
     let mut threshold = None;
+    let mut version = None;
     let mut token = None;
     let mut bucket = None;
     let mut sm_url = SM_URL.to_string();
@@ -221,6 +288,7 @@ fn parse_reconstruct_args(argv: &[String]) -> Result<ReconArgs> {
         match argv[i].as_str() {
             "--env" => env = Some(req_val(argv, i)?),
             "--threshold" => threshold = Some(req_val(argv, i)?.parse().context("--threshold")?),
+            "--version" => version = Some(req_val(argv, i)?.parse().context("--version")?),
             "--token" => token = Some(req_val(argv, i)?),
             "--bucket" => bucket = Some(req_val(argv, i)?),
             "--sm-url" => sm_url = req_val(argv, i)?,
@@ -237,6 +305,7 @@ fn parse_reconstruct_args(argv: &[String]) -> Result<ReconArgs> {
     Ok(ReconArgs {
         env: env.context("--env is required")?,
         threshold: threshold.context("--threshold is required")?,
+        version: version.context("--version is required")?,
         token: token.context("--token is required")?,
         bucket,
         sm_url: require_https("--sm-url", sm_url)?,
@@ -291,18 +360,28 @@ async fn reconstruct_main(argv: &[String]) -> Result<()> {
     // Audiences are stamped by partner_refs but UNUSED here — the CLI
     // authenticates with the operator token, not per-partner federation.
     let fhe_partners = partner_refs(env_cfg, "teecryptor", &a.secret_fhe_priv)?;
-    let fhe = read_fhe_priv(&ctx, &operator_access(&fhe_partners, &a.token), a.threshold)
-        .await
-        .context("reconstruct fhe-priv")?;
+    let fhe = read_fhe_priv(
+        &ctx,
+        &operator_access(&fhe_partners, &a.token),
+        a.threshold,
+        &|_| a.version,
+    )
+    .await
+    .context("reconstruct fhe-priv")?;
     println!(
         "OK  fhe-priv reconstructed {}-of-{} — client_key {} B, decrypt_signer_priv {} B (validated vs published full digest)",
         a.threshold, n, fhe.client_key.len(), fhe.decrypt_signer_priv.len()
     );
 
     let zk_partners = partner_refs(env_cfg, "zee-k", &a.secret_zk_signer)?;
-    let zk = read_zk_signer(&ctx, &operator_access(&zk_partners, &a.token), a.threshold)
-        .await
-        .context("reconstruct zk-signer")?;
+    let zk = read_zk_signer(
+        &ctx,
+        &operator_access(&zk_partners, &a.token),
+        a.threshold,
+        &|_| a.version,
+    )
+    .await
+    .context("reconstruct zk-signer")?;
     println!(
         "OK  zk-signer reconstructed {}-of-{} — zk_signer_priv {} B (validated vs published full digest)",
         a.threshold, n, zk.zk_signer_priv.len()

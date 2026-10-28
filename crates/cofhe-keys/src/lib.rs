@@ -19,3 +19,7 @@ pub mod secrets;
 pub mod serialization;
 pub mod shamir;
 pub mod tls;
+
+// The default mocked Secret Manager version; tests that prove an exact version use their own literal.
+#[cfg(test)]
+pub(crate) const TEST_VERSION: std::num::NonZeroU64 = std::num::NonZeroU64::MIN;
