@@ -10,7 +10,6 @@ use tracing::info;
 // unencrypted): FHE keys + decrypt_signer (TN) + zk_signer (ZK/verifier),
 // Shamir-split N-of-T across the partners — one share pair per partner, index i →
 // partners[i]. Then deliver, then publish the artifacts and the manifest.
-#[cfg(not(feature = "mock"))]
 pub(crate) async fn run_ceremony(cfg: &Config, run: &Run) -> Result<()> {
     // An image built from the wrong env must not replace a live network key. Only a
     // deliberate key rotation bakes `replace_live_keyset`. The legacy name is the
@@ -85,7 +84,6 @@ pub(crate) async fn run_ceremony(cfg: &Config, run: &Run) -> Result<()> {
 
 // A ceremony writes a new keyset. Over a live one that is a key rotation, which
 // the env must bake on purpose.
-#[cfg(not(feature = "mock"))]
 fn check_replace_guard(replace_live_keyset: bool, live_manifest: Option<String>) -> Result<()> {
     if let (Some(name), false) = (live_manifest, replace_live_keyset) {
         bail!(
@@ -96,7 +94,7 @@ fn check_replace_guard(replace_live_keyset: bool, live_manifest: Option<String>)
     Ok(())
 }
 
-#[cfg(all(test, not(feature = "mock")))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::*;

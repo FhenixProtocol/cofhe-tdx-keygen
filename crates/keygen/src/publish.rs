@@ -10,15 +10,11 @@ use tracing::info;
 // (keys/versionized/{zone}/{computation_key,public_key,crs}). The manifest sits
 // alongside for the consumer reader; the provenance sidecar is still written but
 // unread (kept for wire-format compatibility).
-#[cfg(not(feature = "mock"))]
 pub(crate) const OBJ_SERVER_KEY: &str = "computation_key";
-#[cfg(not(feature = "mock"))]
 pub(crate) const OBJ_PUBLIC_KEY: &str = "public_key";
-#[cfg(not(feature = "mock"))]
 pub(crate) const OBJ_CRS: &str = "crs";
 
 // Object key under the per-zone prefix, e.g. keys/versionized/0/computation_key.
-#[cfg(not(feature = "mock"))]
 pub(crate) fn object_path(prefix: &str, zone: u32, name: &str) -> String {
     format!("{}/{}/{}", prefix.trim_end_matches('/'), zone, name)
 }
@@ -26,7 +22,6 @@ pub(crate) fn object_path(prefix: &str, zone: u32, name: &str) -> String {
 // Publish the provenance sidecar and the manifest under each of `objects`, and
 // record each object in `published` after its upload. Consumers do not
 // verify the sidecar; it stays for wire-format compatibility (see AGENTS.md).
-#[cfg(not(feature = "mock"))]
 pub(crate) async fn publish_manifest(
     cfg: &Config,
     run: &Run,
@@ -67,7 +62,7 @@ pub(crate) async fn publish_manifest(
     Ok(())
 }
 
-#[cfg(all(test, not(feature = "mock")))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::*;

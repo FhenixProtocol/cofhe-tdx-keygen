@@ -7,7 +7,6 @@ use std::collections::BTreeSet;
 // target) and its keygen WRITE audience (the attestation/STS audience for that
 // project). Sourced from the baked `EnvConfig`; partner `i` receives share `i` of
 // each split secret.
-#[cfg(not(feature = "mock"))]
 #[derive(Debug, Clone)]
 pub(crate) struct PartnerCfg {
     pub(crate) project_id: String,
@@ -17,7 +16,6 @@ pub(crate) struct PartnerCfg {
 // Which run this image does, from the baked env alone: an env with `reshare_from`
 // builds a reshare image, any other env a ceremony image. No runtime input can
 // change it.
-#[cfg(not(feature = "mock"))]
 pub(crate) enum Mode {
     Ceremony,
     Reshare(&'static ReshareSource),
@@ -27,7 +25,6 @@ pub(crate) enum Mode {
 // `partners[i]`; N = the partner count; T = `threshold`. No SA_EMAIL: each
 // partner's attested federated principal holds secretVersionAdder on its secrets
 // directly.
-#[cfg(not(feature = "mock"))]
 pub(crate) struct Config {
     pub(crate) mode: Mode,
     pub(crate) partners: Vec<PartnerCfg>,
@@ -41,7 +38,6 @@ pub(crate) struct Config {
     pub(crate) env: &'static EnvConfig,
 }
 
-#[cfg(not(feature = "mock"))]
 impl Config {
     // `COFHE_ENV` is the ONLY operator-settable input (besides `RUST_LOG`, honored by
     // tracing) — it selects a BAKED environment and nothing else. Everything else,
@@ -165,7 +161,6 @@ impl Config {
     }
 }
 
-#[cfg(not(feature = "mock"))]
 fn check_threshold(what: &str, t: u8, n: usize) -> Result<()> {
     if t < cofhe_keys::shamir::MIN_THRESHOLD || t as usize > n {
         bail!(
@@ -176,7 +171,6 @@ fn check_threshold(what: &str, t: u8, n: usize) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "mock"))]
 fn check_distinct<'a>(ids: impl Iterator<Item = &'a str>) -> Result<()> {
     let mut seen = BTreeSet::new();
     for id in ids {
@@ -187,7 +181,7 @@ fn check_distinct<'a>(ids: impl Iterator<Item = &'a str>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, not(feature = "mock")))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::*;

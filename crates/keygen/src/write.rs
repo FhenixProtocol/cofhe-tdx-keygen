@@ -10,7 +10,6 @@ use tracing::info;
 
 // The payload of a filler version. It is not an envelope, so a read of a filler
 // fails closed.
-#[cfg(not(feature = "mock"))]
 const FILLER: &[u8] = &[0xde, 0xad, 0xbe, 0xef];
 
 // Deliver the SECRET shares to every target partner, each at the baked
@@ -22,7 +21,6 @@ const FILLER: &[u8] = &[0xde, 0xad, 0xbe, 0xef];
 //
 // The precheck runs on every partner before any write, and every filler before any
 // share, so a stop before the shares leaves the target version free.
-#[cfg(not(feature = "mock"))]
 pub(crate) async fn deliver_shares(
     cfg: &Config,
     run: &Run,
@@ -90,7 +88,6 @@ pub(crate) async fn deliver_shares(
 
 // Record a version this run wrote, then stop if Secret Manager gave it another
 // number than the one expected (a timed-out add can still create a version).
-#[cfg(not(feature = "mock"))]
 fn record(
     written: &mut Vec<Written>,
     partner: &str,
@@ -114,7 +111,6 @@ fn record(
 }
 
 // One version this run wrote: a real share, or a filler below the target.
-#[cfg(not(feature = "mock"))]
 pub(crate) struct Written {
     partner: String,
     secret: String,
@@ -124,11 +120,9 @@ pub(crate) struct Written {
 
 // Marks an error from a Secret Manager add: the add may still have created the
 // version, so the report cannot promise that the target is free.
-#[cfg(not(feature = "mock"))]
 #[derive(Debug)]
 struct AddFailed;
 
-#[cfg(not(feature = "mock"))]
 impl std::fmt::Display for AddFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("a Secret Manager add failed")
@@ -137,11 +131,9 @@ impl std::fmt::Display for AddFailed {
 
 // Marks the precheck stop: nothing is written, and the error itself says what to
 // do, so it gets no recovery report.
-#[cfg(not(feature = "mock"))]
 #[derive(Debug)]
 struct PrecheckStop;
 
-#[cfg(not(feature = "mock"))]
 impl std::fmt::Display for PrecheckStop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("the precheck stopped the run before any write")
@@ -150,7 +142,6 @@ impl std::fmt::Display for PrecheckStop {
 
 // A stop after the first write changes what recovery needs, and what a consumer
 // that restarts now can read. Say it in the error, from what this run knows.
-#[cfg(not(feature = "mock"))]
 pub(crate) fn with_report(
     e: anyhow::Error,
     cfg: &Config,
@@ -169,7 +160,6 @@ pub(crate) fn with_report(
 // What a stopped run leaves behind, and how to rerun. `published` lists the
 // public-material objects this run already wrote; `in_add` says the run stopped
 // inside an add.
-#[cfg(not(feature = "mock"))]
 fn recovery_report(
     cfg: &Config,
     written: &[Written],
@@ -233,7 +223,6 @@ fn recovery_report(
 /// Mint a provenance token binding `SHA-256(payload)`, wrap it in a
 /// [`SecretEnvelope`], and write it as a new version of `secret`. Access pattern
 /// B: the federated token is the Secret Manager bearer directly.
-#[cfg(not(feature = "mock"))]
 async fn write_secret(
     attest: &AttestationClient,
     sm: &SecretManager,
@@ -264,7 +253,7 @@ async fn write_secret(
     Ok(version)
 }
 
-#[cfg(all(test, not(feature = "mock")))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::*;
