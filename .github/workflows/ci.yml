@@ -13,6 +13,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          # The share_version check builds origin/main in a second worktree.
+          fetch-depth: 0
 
       # `rustup show` reads rust-toolchain.toml and installs the pinned channel.
       # The version source of truth stays in rust-toolchain.toml, not here.
@@ -58,6 +61,21 @@ jobs:
 
       - name: reader.rs ↔ terraform public-material drift
         run: ./scripts/check-tf-reader-drift.sh
+
+      # A partner never gets a share below a number it already holds, so a baked
+      # share_version must never go down.
+      - name: share_version never goes down
+        run: ./scripts/check-share-version-never-down.sh origin/main
+
+      - name: share_version check self-test
+        run: |
+          echo "staging 9" > old
+          echo "staging 8" > new
+          if ./scripts/check-share-version-never-down.sh --files old new; then
+            echo "the check missed a version that went down" >&2
+            exit 1
+          fi
+          ./scripts/check-share-version-never-down.sh --files new old
 
   # Build the enclave image from the Dockerfile and run it. The cargo jobs above
   # build on the runner, not in the image, so they cannot see a fault between the

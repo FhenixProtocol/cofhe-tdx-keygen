@@ -18,7 +18,7 @@ if [ "$#" -ne 1 ]; then
   exit 2
 fi
 image="$1"
-# The context string of Config::from_env in crates/keygen/src/main.rs. A change
+# The context string of Config::from_env in crates/keygen/src/config.rs. A change
 # to that message must change this line too.
 expected='env var COFHE_ENV not set'
 

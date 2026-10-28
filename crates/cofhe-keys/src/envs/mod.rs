@@ -8,10 +8,20 @@
 //! keep working for read-side consumers unchanged.
 
 use anyhow::{anyhow, Result};
+use std::num::NonZeroU64;
+
+mod mainnet;
+mod staging;
+mod testnet;
+
+use mainnet::MAINNET;
+use staging::STAGING;
+use testnet::TESTNET;
 
 /// The reader's key SOURCE is baked at compile time — never operator-settable.
 /// One entry per blessed env. Onboarding an env, and changing a partner SET within
-/// one, are both rebuilds by design; a same-set reshare touches nothing here.
+/// one, are both rebuilds by design; a same-set reshare changes only the versions.
+#[derive(Clone, Copy)]
 pub struct EnvPartner {
     pub project_id: &'static str,
     /// Pool-level audience at this partner:
@@ -29,148 +39,92 @@ pub struct EnvPartner {
 }
 
 /// One blessed environment's key source: the partner set holding the Shamir
-/// shares, the public-material location, and the reconstruction threshold. Shared
-/// by the consumer readers (which read `public_object` + reconstruct with
-/// `shamir_threshold`) and the producer keygen (which writes to `keygen_write_audience`
-/// and lays out `{public_prefix}/{public_zone}/…`), so producer and consumer agree
-/// on the partner set and T by construction.
+/// shares, the share version, the public-material location, and the
+/// reconstruction threshold. Shared by the consumer readers (which read
+/// [`EnvConfig::manifest_object`] and the shares at `share_version`, then
+/// reconstruct with `shamir_threshold`) and the producer keygen (which writes to
+/// `keygen_write_audience` and lays out `{public_prefix}/{public_zone}/…`), so
+/// producer and consumer agree on the partner set, the version and T by
+/// construction.
 pub struct EnvConfig {
     pub partners: &'static [EnvPartner],
     pub public_bucket: &'static str,
-    /// The consumer's read path to the manifest =
-    /// `{public_prefix}/{public_zone}/public-material`.
-    pub public_object: &'static str,
     /// Producer-side layout: the ceremony writes
-    /// `{public_prefix}/{public_zone}/{computation_key,public_key,crs,public-material}`.
+    /// `{public_prefix}/{public_zone}/{computation_key,public_key,crs}` and the
+    /// manifest at [`EnvConfig::manifest_object`].
     pub public_prefix: &'static str,
     pub public_zone: u32,
     /// Shamir reconstruction threshold (T). Baked once here so the producer's split
     /// and every consumer's reconstruct agree on T (N is the partner count).
     pub shamir_threshold: u8,
+    /// Target version: every partner holds both shares at this number.
+    pub share_version: NonZeroU64,
+    /// The partner set that holds the live shares, when the next keygen run is a
+    /// reshare. `partners` and `shamir_threshold` above are then the target set.
+    /// Consumers read no shares from this set, but their placeholder gate still
+    /// checks it (`ensure_partners_complete`). The keygen image built from an env
+    /// with this field can only reshare; without it, only a ceremony. Remove it once
+    /// the reshare is done.
+    pub reshare_from: Option<ReshareSource>,
+    /// Set this only for a deliberate new keyset (a key rotation). It has no
+    /// meaning for a reshare.
+    pub replace_live_keyset: bool,
 }
 
-const STAGING: EnvConfig = EnvConfig {
-    partners: &[
-        EnvPartner {
-            project_id: "cofhe-tee-partner-1",
-            wip_pool_audience: "//iam.googleapis.com/projects/719732368646/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
-            keygen_write_audience: "//iam.googleapis.com/projects/719732368646/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
-        },
-        EnvPartner {
-            project_id: "cofhe-tee-partner-2",
-            wip_pool_audience: "//iam.googleapis.com/projects/558994189066/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
-            keygen_write_audience: "//iam.googleapis.com/projects/558994189066/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
-        },
-        EnvPartner {
-            project_id: "cofhe-tee-partner-3",
-            wip_pool_audience: "//iam.googleapis.com/projects/499488488731/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
-            keygen_write_audience: "//iam.googleapis.com/projects/499488488731/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
-        },
-        EnvPartner {
-            project_id: "cofhe-tee-partner-4",
-            wip_pool_audience: "//iam.googleapis.com/projects/467122964772/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
-            keygen_write_audience: "//iam.googleapis.com/projects/467122964772/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
-        },
-        EnvPartner {
-            project_id: "cofhe-tee-partner-5",
-            wip_pool_audience: "//iam.googleapis.com/projects/926992419891/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
-            keygen_write_audience: "//iam.googleapis.com/projects/926992419891/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
-        },
-    ],
-    public_bucket: "localcofhenix",
-    public_object: "generator/keys/versionized/0/public-material",
-    public_prefix: "generator/keys/versionized",
-    public_zone: 0,
-    shamir_threshold: 2,
-};
+/// The source of a reshare: the partner set that holds the live shares, the
+/// threshold and version those shares were written with, and an anchor on the
+/// live keyset.
+///
+/// The anchor is the two signer addresses of the live keyset. They are public and
+/// on-chain. The reshare refuses a manifest whose addresses differ, so a bucket
+/// writer cannot swap in an older keyset's manifest, and with it an older key, for
+/// the run to split again.
+pub struct ReshareSource {
+    pub partners: &'static [SourcePartner],
+    pub shamir_threshold: u8,
+    pub share_version: NonZeroU64,
+    /// The staging migration to unity versions only: the source manifest has the
+    /// legacy unversioned name, and the run also writes that name.
+    pub legacy_manifest: bool,
+    pub decrypt_signer_address: &'static str,
+    pub zk_signer_address: &'static str,
+}
 
-const TESTNET: EnvConfig = EnvConfig {
-    partners: &[
-        EnvPartner {
-            project_id: "fhenix-testnet-tee-partner-1",
-            wip_pool_audience: "//iam.googleapis.com/projects/1075523748493/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
-            keygen_write_audience: "//iam.googleapis.com/projects/1075523748493/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
-        },
-        EnvPartner {
-            project_id: "fhenix-testnet-tee-partner-2",
-            wip_pool_audience: "//iam.googleapis.com/projects/114880301918/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
-            keygen_write_audience: "//iam.googleapis.com/projects/114880301918/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
-        },
-        EnvPartner {
-            project_id: "fhenix-testnet-tee-partner-3",
-            wip_pool_audience: "//iam.googleapis.com/projects/513013593200/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
-            keygen_write_audience: "//iam.googleapis.com/projects/513013593200/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
-        },
-    ],
-    public_bucket: "fhenix-testnet-v2",
-    public_object: "generator/keys/versionized/0/public-material",
-    public_prefix: "generator/keys/versionized",
-    public_zone: 0,
-    shamir_threshold: 2,
-};
+/// One source partner and the version its two shares sit at.
+pub struct SourcePartner {
+    pub partner: EnvPartner,
+    /// None = ReshareSource.share_version.
+    pub share_version: Option<NonZeroU64>,
+}
 
-/// The mainnet partner set: six key-share holders, threshold 3. Each runs the partner
-/// stack in its own GCP project, and reconstructing a secret needs 3 of the 6, so no
-/// single operator holds a usable secret.
-///
-/// The set is complete: every slot holds a real project id and project number, so
-/// [`EnvConfig::ensure_partners_complete`] passes. The gate stays in place for a slot
-/// vacated later — it blocks the ceremony ([`crate::envs`] consumers call it at config
-/// build) and the read side ([`crate::reader::partner_refs`]).
-///
-/// Every slot is one operator, one project, and all six are treated identically here.
-/// A project name is chosen by its operator and identifies no one — do not read
-/// ownership, or a guarantee of third-party independence, off these strings.
-///
-/// Changing the partner set is NOT a config change. It is: edit the entries below,
-/// rebuild every consumer (the source is compile-time), re-pin the new consumer
-/// digests in the env's `keygen-partners` var-file, and have all six partners
-/// re-apply the partner stack. Plan for that sequence — there is no shortcut that
-/// skips the rebuild.
-const MAINNET: EnvConfig = EnvConfig {
-    partners: &[
-        EnvPartner {
-            project_id: "fhenix-507307",
-            wip_pool_audience: "//iam.googleapis.com/projects/5428800810/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
-            keygen_write_audience: "//iam.googleapis.com/projects/5428800810/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
-        },
-        EnvPartner {
-            project_id: "fhenix-508321",
-            wip_pool_audience: "//iam.googleapis.com/projects/262617433943/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
-            keygen_write_audience: "//iam.googleapis.com/projects/262617433943/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
-        },
-        EnvPartner {
-            project_id: "nodes-fhenix",
-            wip_pool_audience: "//iam.googleapis.com/projects/442786234206/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
-            keygen_write_audience: "//iam.googleapis.com/projects/442786234206/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
-        },
-        EnvPartner {
-            project_id: "fhenix-mainnet-key-share",
-            wip_pool_audience: "//iam.googleapis.com/projects/772683464839/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
-            keygen_write_audience: "//iam.googleapis.com/projects/772683464839/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
-        },
-        EnvPartner {
-            project_id: "validator-fhenix",
-            wip_pool_audience: "//iam.googleapis.com/projects/581791888267/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
-            keygen_write_audience: "//iam.googleapis.com/projects/581791888267/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
-        },
-        EnvPartner {
-            project_id: "fhenix-508914",
-            wip_pool_audience: "//iam.googleapis.com/projects/902597681407/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
-            keygen_write_audience: "//iam.googleapis.com/projects/902597681407/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
-        },
-    ],
-    // This is the single source of truth for the mainnet public location;
-    // public_object = "{public_prefix}/{public_zone}/public-material". terraform/service
-    // mirrors public_bucket + public_prefix in local.public_material only to scope the
-    // read grant's IAM condition, and CI (check-tf-reader-drift.sh) enforces the match —
-    // the ceremony lays out the path from what is baked here.
-    public_bucket: "fhenix-mainnet-keys",
-    public_object: "generator/keys/versionized/0/public-material",
-    public_prefix: "generator/keys/versionized",
-    public_zone: 0,
-    shamir_threshold: 3,
-};
+/// Builds a baked share version. The env files write every version as `v(N)`,
+/// because scripts outside this crate parse that literal.
+pub const fn v(n: u64) -> NonZeroU64 {
+    match NonZeroU64::new(n) {
+        Some(v) => v,
+        None => panic!("a share version is >= 1"),
+    }
+}
+
+impl ReshareSource {
+    /// The version of both secrets at one source partner.
+    pub fn version_for(&self, project_id: &str) -> NonZeroU64 {
+        self.partners
+            .iter()
+            .find(|s| s.partner.project_id == project_id)
+            .and_then(|s| s.share_version)
+            .unwrap_or(self.share_version)
+    }
+
+    /// The manifest that lists the source shares.
+    pub fn manifest_object(&self, env: &EnvConfig) -> String {
+        if self.legacy_manifest {
+            env.legacy_manifest_object()
+        } else {
+            env.manifest_at(self.share_version)
+        }
+    }
+}
 
 /// Marks a partner slot that is declared but not yet filled in. A slot keeps the
 /// real shape (so N and T are honest from the start) while the operator's project
@@ -178,6 +132,59 @@ const MAINNET: EnvConfig = EnvConfig {
 pub const PARTNER_PLACEHOLDER: &str = "FILL-ME-";
 
 impl EnvConfig {
+    /// The folder that holds the public objects: `{public_prefix}/{public_zone}`.
+    pub fn manifest_dir(&self) -> String {
+        format!("{}/{}", self.public_prefix, self.public_zone)
+    }
+
+    /// The manifest of the keyset at `share_version`.
+    pub fn manifest_object(&self) -> String {
+        self.manifest_at(self.share_version)
+    }
+
+    /// The manifest of the keyset at `version`: `{dir}/public-material.v{version}`.
+    pub fn manifest_at(&self, version: NonZeroU64) -> String {
+        format!("{}/public-material.v{version}", self.manifest_dir())
+    }
+
+    /// The manifest name from before share versions. Only the staging migration
+    /// reads it.
+    pub fn legacy_manifest_object(&self) -> String {
+        format!("{}/public-material", self.manifest_dir())
+    }
+
+    /// FAIL-CLOSED: every version a reshare reads is below the target, so every
+    /// reshare writes new versions and never overwrites what readers use. An
+    /// override equal to the source version is a no-op that hides a typo.
+    pub fn check_versions(&self) -> Result<()> {
+        let Some(r) = &self.reshare_from else {
+            return Ok(());
+        };
+        let target = self.share_version;
+        if r.share_version >= target {
+            return Err(anyhow!(
+                "the reshare source share_version {} is not below the target share_version {target}",
+                r.share_version
+            ));
+        }
+        for s in r.partners {
+            let Some(x) = s.share_version else { continue };
+            if x >= target {
+                return Err(anyhow!(
+                    "source partner {:?} share_version {x} is not below the target share_version {target}",
+                    s.partner.project_id
+                ));
+            }
+            if x == r.share_version {
+                return Err(anyhow!(
+                    "source partner {:?} overrides share_version with {x}, which equals the source share_version",
+                    s.partner.project_id
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// FAIL-CLOSED: `Err` while any partner slot is still a placeholder.
     ///
     /// This is deliberately NOT enforced in [`lookup`]. An incomplete env still has a
@@ -186,9 +193,14 @@ impl EnvConfig {
     /// paths that actually touch the partner set: the ceremony's config build and the
     /// reader's reconstruct. Both call this.
     pub fn ensure_partners_complete(&self) -> Result<()> {
+        let sources = self
+            .reshare_from
+            .iter()
+            .flat_map(|r| r.partners.iter().map(|s| &s.partner));
         let pending: Vec<&str> = self
             .partners
             .iter()
+            .chain(sources)
             .filter(|p| {
                 p.project_id.starts_with(PARTNER_PLACEHOLDER)
                     || p.wip_pool_audience.contains(PARTNER_PLACEHOLDER)
@@ -201,7 +213,7 @@ impl EnvConfig {
         }
         Err(anyhow!(
             "partner set is incomplete: {pending:?} still {} a placeholder. Fill the \
-             real project id and number in envs.rs and rebuild (fail-closed: a \
+             real project id and number in envs/<env>.rs and rebuild (fail-closed: a \
              placeholder audience would abort a ceremony only after the keyset is \
              generated and the earlier partners are already written)",
             if pending.len() == 1 { "is" } else { "are" }
@@ -262,7 +274,7 @@ mod tests {
         for (name, cfg) in ENVIRONMENTS {
             assert!(
                 !cfg.public_bucket.contains(PARTNER_PLACEHOLDER)
-                    && !cfg.public_object.contains(PARTNER_PLACEHOLDER),
+                    && !cfg.manifest_object().contains(PARTNER_PLACEHOLDER),
                 "env {name:?} still has a placeholder public bucket/object"
             );
         }
@@ -338,10 +350,87 @@ mod tests {
         EnvConfig {
             partners,
             public_bucket: "b",
-            public_object: "p/0/public-material",
             public_prefix: "p",
             public_zone: 0,
             shamir_threshold: 2,
+            share_version: v(1),
+            reshare_from: None,
+            replace_live_keyset: false,
+        }
+    }
+
+    // Partners p1..p3 on both sides; `source` is (version, overrides, legacy_manifest).
+    type Source = Option<(u64, &'static [(&'static str, u64)], bool)>;
+
+    fn env_with_versions(target: u64, source: Source) -> &'static EnvConfig {
+        let ps: &'static [EnvPartner] = Box::leak(
+            vec![
+                partner("p1", "111111111111"),
+                partner("p2", "222222222222"),
+                partner("p3", "333333333333"),
+            ]
+            .into_boxed_slice(),
+        );
+        let mut env = env_with(ps);
+        env.share_version = v(target);
+        env.reshare_from = source.map(|(version, overrides, legacy_manifest)| ReshareSource {
+            partners: Box::leak(
+                ps.iter()
+                    .map(|&partner| SourcePartner {
+                        partner,
+                        share_version: overrides
+                            .iter()
+                            .find(|(id, _)| *id == partner.project_id)
+                            .map(|&(_, n)| v(n)),
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ),
+            shamir_threshold: 2,
+            share_version: v(version),
+            legacy_manifest,
+            decrypt_signer_address: "0x1111111111111111111111111111111111111111",
+            zk_signer_address: "0x2222222222222222222222222222222222222222",
+        });
+        Box::leak(Box::new(env))
+    }
+
+    #[test]
+    fn manifest_names_carry_the_version() {
+        let e = env_with_versions(9, None);
+        assert_eq!(e.manifest_object(), "p/0/public-material.v9");
+        assert_eq!(e.legacy_manifest_object(), "p/0/public-material");
+    }
+
+    #[test]
+    fn a_source_partner_override_wins() {
+        let e = env_with_versions(9, Some((5, &[("p1", 8)], true)));
+        let r = e.reshare_from.as_ref().unwrap();
+        assert_eq!(r.version_for("p1").get(), 8);
+        assert_eq!(r.version_for("p2").get(), 5);
+        assert_eq!(r.manifest_object(e), "p/0/public-material");
+    }
+
+    #[test]
+    fn versions_must_climb() {
+        assert!(env_with_versions(5, Some((5, &[], false)))
+            .check_versions()
+            .is_err());
+        assert!(env_with_versions(8, Some((5, &[("p1", 8)], false)))
+            .check_versions()
+            .is_err());
+        assert!(env_with_versions(9, Some((5, &[("p1", 5)], false)))
+            .check_versions()
+            .is_err());
+        assert!(env_with_versions(9, Some((5, &[("p1", 8)], true)))
+            .check_versions()
+            .is_ok());
+    }
+
+    #[test]
+    fn every_baked_env_has_climbing_versions() {
+        for name in env_names() {
+            lookup(name).unwrap().check_versions().unwrap();
         }
     }
 
@@ -373,6 +462,43 @@ mod tests {
             .into_boxed_slice(),
         );
         assert!(env_with(ps).ensure_partners_complete().is_err());
+    }
+
+    // A reshare reads from the source set, so an open slot there must fail too.
+    #[test]
+    fn an_open_slot_in_the_reshare_source_fails_the_gate() {
+        let target: &'static [EnvPartner] = Box::leak(
+            vec![
+                partner("real-1", "111111111111"),
+                partner("real-2", "222222222222"),
+            ]
+            .into_boxed_slice(),
+        );
+        let source: &'static [SourcePartner] = Box::leak(
+            [
+                partner("real-1", "111111111111"),
+                partner("FILL-ME-PARTNER-3", "333333333333"),
+            ]
+            .map(|partner| SourcePartner {
+                partner,
+                share_version: None,
+            })
+            .into(),
+        );
+        let mut env = env_with(target);
+        env.reshare_from = Some(ReshareSource {
+            partners: source,
+            shamir_threshold: 2,
+            share_version: v(1),
+            legacy_manifest: false,
+            decrypt_signer_address: "0x1111111111111111111111111111111111111111",
+            zk_signer_address: "0x2222222222222222222222222222222222222222",
+        });
+        let err = env
+            .ensure_partners_complete()
+            .expect_err("an open source slot must fail closed")
+            .to_string();
+        assert!(err.contains("FILL-ME-PARTNER-3"), "{err}");
     }
 
     #[test]

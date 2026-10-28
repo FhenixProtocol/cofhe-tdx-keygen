@@ -15,7 +15,7 @@ consumer reads that token (see `DESIGN.md` §7).
 > **Status:** bootstrap/genesis scope, shipped end-to-end. Shamir threshold
 > splitting is live: each secret splits into one share per partner, and a threshold
 > of shares reconstructs it. The partner count (N) and threshold (T) are baked per
-> environment in `crates/cofhe-keys/src/envs.rs`. The cloud round-trip and the
+> environment in `crates/cofhe-keys/src/envs/`. The cloud round-trip and the
 > consumer wiring both run on real Confidential Space (Intel TDX) — staging since
 > 2026-07-21, testnet since 2026-07-30. See `CONSUMER-INTEGRATION.md`.
 

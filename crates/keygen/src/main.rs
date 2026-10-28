@@ -5,6 +5,15 @@ mod attestation;
 #[cfg(not(feature = "mock"))]
 mod gcp_auth;
 
+#[cfg(not(feature = "mock"))]
+mod config;
+#[cfg(not(feature = "mock"))]
+mod publish;
+#[cfg(all(test, not(feature = "mock")))]
+mod test_support;
+#[cfg(not(feature = "mock"))]
+mod write;
+
 #[cfg(feature = "mock")]
 mod mock;
 
@@ -15,11 +24,15 @@ use tracing_subscriber::EnvFilter;
 #[cfg(not(feature = "mock"))]
 use crate::attestation::AttestationClient;
 #[cfg(not(feature = "mock"))]
+use crate::config::{Config, Mode};
+#[cfg(not(feature = "mock"))]
 use crate::gcp_auth::{GcpAuth, MetadataClient};
 #[cfg(not(feature = "mock"))]
-use anyhow::{bail, Context};
+use crate::publish::{object_path, OBJ_CRS, OBJ_MANIFEST, OBJ_PUBLIC_KEY, OBJ_SERVER_KEY};
 #[cfg(not(feature = "mock"))]
-use cofhe_keys::serialization::{sha256, SecretEnvelope};
+use crate::write::write_secret;
+#[cfg(not(feature = "mock"))]
+use anyhow::bail;
 #[cfg(not(feature = "mock"))]
 use cofhe_keys::{gcs::GcsClient, keygen, secrets::SecretManager};
 
@@ -46,38 +59,6 @@ const METADATA_URL: &str = "http://metadata.google.internal";
 #[cfg(not(feature = "mock"))]
 const PROVENANCE_AUDIENCE: &str = "cofhe-keygen-provenance";
 
-// Public GCS object layout under the baked `{public_prefix}/{public_zone}/`. The three FHE artifacts
-// use cofhe's exact mounted file names, so a cofhe stack pointed at this bucket
-// reads this ceremony's keyset directly as files
-// (keys/versionized/{zone}/{computation_key,public_key,crs}). The manifest sits
-// alongside for the consumer reader; the provenance sidecar is still written but
-// unread (kept for wire-format compatibility).
-#[cfg(not(feature = "mock"))]
-const OBJ_SERVER_KEY: &str = "computation_key";
-#[cfg(not(feature = "mock"))]
-const OBJ_PUBLIC_KEY: &str = "public_key";
-#[cfg(not(feature = "mock"))]
-const OBJ_CRS: &str = "crs";
-#[cfg(not(feature = "mock"))]
-const OBJ_MANIFEST: &str = "public-material";
-
-// Object key under the per-zone prefix, e.g. keys/versionized/0/computation_key.
-#[cfg(not(feature = "mock"))]
-fn object_path(prefix: &str, zone: u32, name: &str) -> String {
-    format!("{}/{}/{}", prefix.trim_end_matches('/'), zone, name)
-}
-
-// One partner of the Shamir ceremony: its GCP project (the cross-project write
-// target) and its keygen WRITE audience (the attestation/STS audience for that
-// project). Sourced from the baked `EnvConfig`; partner `i` receives share `i` of
-// each split secret.
-#[cfg(not(feature = "mock"))]
-#[derive(Debug, Clone)]
-struct PartnerCfg {
-    project_id: String,
-    wip_audience: String,
-}
-
 // The two per-audience partner secret names, same in EVERY partner project (each
 // holds that partner's share): TeeCryptor's FHE priv + decrypt signer, and the ZK
 // verifier's signer. Network-wide fixed ids — the consumers read the SAME names —
@@ -86,119 +67,6 @@ struct PartnerCfg {
 const WRITE_SECRET_FHE_PRIV: &str = "cofhe-tee-fhe-priv";
 #[cfg(not(feature = "mock"))]
 const WRITE_SECRET_ZK_SIGNER: &str = "cofhe-tee-zk-signer";
-
-// The ceremony shape is BAKED per environment (partners + their write audiences,
-// N/T, public bucket + layout) in `cofhe_keys::envs`, selected by `COFHE_ENV` — the
-// only operator-settable input besides `RUST_LOG`, and it is constrained to the
-// baked environments (fail-closed). Nothing here is settable via a VM metadata
-// override. `partners` is the partner set the Shamir shares are written to (share
-// i → partner i); `shares` (N) equals the partner count; `threshold` (T) is the
-// reconstruction threshold. Direct federated grant: each partner's attested
-// federated principal holds secretVersionAdder directly on its secrets, so there is
-// no service account to impersonate (no SA_EMAIL).
-#[cfg(not(feature = "mock"))]
-struct Config {
-    partners: Vec<PartnerCfg>,
-    shares: u8,
-    threshold: u8,
-    write_secret_fhe_priv: String,
-    write_secret_zk_signer: String,
-    public_bucket: String,
-    // Prefix + security zone under which the public objects are laid out, matching
-    // cofhe's mounted key path (keys/versionized/{zone}/…), so a cofhe stack reads
-    // this ceremony's keyset directly.
-    public_prefix: String,
-    zone: u32,
-}
-
-#[cfg(not(feature = "mock"))]
-impl Config {
-    // `COFHE_ENV` is the ONLY operator-settable ceremony input (besides `RUST_LOG`,
-    // honored by tracing) — it selects a BAKED environment and nothing else. Everything
-    // else is compiled in, so a VM metadata override cannot redirect the write set,
-    // weaken the threshold, or repoint the public bucket.
-    fn from_env() -> Result<Self> {
-        let env = std::env::var("COFHE_ENV").context(
-            "env var COFHE_ENV not set (baked-environment selector: staging | testnet | mainnet)",
-        )?;
-        Self::for_env(&env)
-    }
-
-    // Build the ceremony config from a baked environment. Fails closed on any env not
-    // in `cofhe_keys::envs`' map (no default, no fallback). N (shares) is the baked
-    // partner count; T (threshold), the partner write audiences, the public bucket and
-    // its layout are all baked; the two partner secret ids are network-wide constants.
-    fn for_env(env: &str) -> Result<Self> {
-        let ec = cofhe_keys::envs::lookup(env)?;
-        // Fail before a single key is generated. A placeholder audience would
-        // otherwise abort the run mid-ceremony, after earlier partners are written.
-        ec.ensure_partners_complete()
-            .with_context(|| format!("environment {env:?} cannot run a ceremony"))?;
-        let partners: Vec<PartnerCfg> = ec
-            .partners
-            .iter()
-            .map(|p| PartnerCfg {
-                project_id: p.project_id.to_string(),
-                wip_audience: p.keygen_write_audience.to_string(),
-            })
-            .collect();
-
-        let cfg = Config {
-            shares: partners.len() as u8,
-            threshold: ec.shamir_threshold,
-            partners,
-            write_secret_fhe_priv: WRITE_SECRET_FHE_PRIV.to_string(),
-            write_secret_zk_signer: WRITE_SECRET_ZK_SIGNER.to_string(),
-            public_bucket: ec.public_bucket.to_string(),
-            public_prefix: ec.public_prefix.to_string(),
-            zone: ec.public_zone,
-        };
-        cfg.validate()?;
-        Ok(cfg)
-    }
-
-    // Fail-closed validation of the ceremony shape. The N-partners ↔ N-shares
-    // invariant (share i → partner i) and distinct partner ids are load-bearing:
-    // the per-partner digest lists key by partner identity, so a duplicate id would
-    // make two entries collide, and a count mismatch would leave a partner without a
-    // share (or a share without a home). These now guard the baked env config.
-    fn validate(&self) -> Result<()> {
-        if self.partners.is_empty() {
-            bail!("baked environment lists no partners");
-        }
-        if self.partners.len() != self.shares as usize {
-            bail!(
-                "share count ({}) must equal the partner count ({}): one share per partner",
-                self.shares,
-                self.partners.len()
-            );
-        }
-        if self.threshold < cofhe_keys::shamir::MIN_THRESHOLD || self.threshold > self.shares {
-            bail!(
-                "threshold T ({}) must satisfy {} <= T <= N ({})",
-                self.threshold,
-                cofhe_keys::shamir::MIN_THRESHOLD,
-                self.shares
-            );
-        }
-        for (i, p) in self.partners.iter().enumerate() {
-            // Empty fields would mean a malformed baked env entry; reject at startup
-            // rather than fail later with an opaque attestation/STS 403.
-            if p.project_id.is_empty() {
-                bail!("baked partner #{i} has an empty project_id");
-            }
-            if p.wip_audience.is_empty() {
-                bail!("baked partner {:?} has an empty wip_audience", p.project_id);
-            }
-            for q in &self.partners[i + 1..] {
-                if p.project_id == q.project_id {
-                    bail!("duplicate baked partner project_id {:?}", p.project_id);
-                }
-            }
-        }
-        Ok(())
-    }
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -236,6 +104,19 @@ async fn main() -> Result<()> {
 #[cfg(not(feature = "mock"))]
 async fn real_boot() -> Result<()> {
     let cfg = Config::from_env()?;
+    if let Mode::Reshare(r) = cfg.mode {
+        info!(share_version = %cfg.env.share_version, source_manifest = %r.manifest_object(cfg.env), "reshare target");
+        for s in r.partners {
+            info!(partner = %s.partner.project_id, share_version = %r.version_for(s.partner.project_id), "reshare source");
+        }
+        bail!(
+            "reshare image: this build validates a reshare config ({} sources, T={}, live signers {} and {}) but cannot run one",
+            r.partners.len(),
+            r.shamir_threshold,
+            r.decrypt_signer_address,
+            r.zk_signer_address
+        );
+    }
     info!(
         partners = cfg.partners.len(),
         shares = cfg.shares,
@@ -372,178 +253,4 @@ async fn real_boot() -> Result<()> {
         "keygen ceremony complete"
     );
     Ok(())
-}
-
-/// Mint a provenance token binding `SHA-256(payload)`, wrap it in a
-/// [`SecretEnvelope`], and write it as a new version of `secret`. Access pattern
-/// B: the federated token is the Secret Manager bearer directly.
-#[cfg(not(feature = "mock"))]
-async fn write_secret(
-    attest: &AttestationClient,
-    sm: &SecretManager,
-    federated: &str,
-    project_id: &str,
-    secret: &str,
-    payload: Vec<u8>,
-) -> Result<()> {
-    let payload_hash = hex::encode(sha256(&payload));
-    info!(secret = %secret, payload_hash = %payload_hash, "minting provenance (eat_nonce = SHA-256(payload))");
-    let provenance_jwt = attest
-        .fetch_token_with_nonces(PROVENANCE_AUDIENCE, &[payload_hash])
-        .await?;
-    let envelope = SecretEnvelope {
-        payload,
-        provenance_jwt,
-    };
-    let version = sm
-        .add_version(
-            federated,
-            project_id,
-            secret,
-            &envelope.to_canonical_bytes(),
-        )
-        .await?;
-    info!(secret = %secret, version = %version, "secret written to partner Secret Manager");
-    Ok(())
-}
-
-#[cfg(all(test, not(feature = "mock")))]
-mod tests {
-    use super::*;
-
-    fn partner(id: &str) -> PartnerCfg {
-        PartnerCfg {
-            project_id: id.to_string(),
-            wip_audience: format!("//iam/{id}/wip"),
-        }
-    }
-
-    fn cfg(partners: Vec<PartnerCfg>, shares: u8, threshold: u8) -> Config {
-        Config {
-            partners,
-            shares,
-            threshold,
-            write_secret_fhe_priv: "fhe".to_string(),
-            write_secret_zk_signer: "zk".to_string(),
-            public_bucket: "bucket".to_string(),
-            public_prefix: "keys/versionized".to_string(),
-            zone: 0,
-        }
-    }
-
-    // The baked staging env yields a valid 5-partner / 2-of-5 ceremony whose write
-    // audiences point at the keygen pool+provider (NOT the reader pool) and whose
-    // secret ids + public layout are the baked constants.
-    #[test]
-    fn builds_staging_from_baked_env() {
-        let cfg = Config::for_env("staging").unwrap();
-        assert_eq!(cfg.partners.len(), 5);
-        assert_eq!(cfg.shares, 5);
-        assert_eq!(cfg.threshold, 2);
-        assert_eq!(cfg.partners[0].project_id, "cofhe-tee-partner-1");
-        assert!(cfg.partners[0]
-            .wip_audience
-            .contains("/workloadIdentityPools/cofhe-tee-keygen-pool/"));
-        assert!(cfg.partners[0]
-            .wip_audience
-            .ends_with("/providers/cofhe-tee-keygen-provider"));
-        assert_eq!(cfg.write_secret_fhe_priv, "cofhe-tee-fhe-priv");
-        assert_eq!(cfg.write_secret_zk_signer, "cofhe-tee-zk-signer");
-        assert_eq!(cfg.public_bucket, "localcofhenix");
-        assert_eq!(cfg.public_prefix, "generator/keys/versionized");
-        assert_eq!(cfg.zone, 0);
-    }
-
-    #[test]
-    fn builds_testnet_from_baked_env() {
-        let cfg = Config::for_env("testnet").unwrap();
-        assert_eq!(cfg.partners.len(), 3);
-        assert_eq!(cfg.shares, 3);
-        assert_eq!(cfg.threshold, 2);
-        assert_eq!(cfg.public_bucket, "fhenix-testnet-v2");
-    }
-
-    #[test]
-    // The mainnet partner set is complete, so it builds a real 3-of-6 ceremony whose
-    // write audiences point at the keygen pool+provider, not the reader pool.
-    fn builds_mainnet_from_baked_env() {
-        let cfg = Config::for_env("mainnet").expect("the mainnet partner set is complete");
-        assert_eq!(cfg.partners.len(), 6);
-        assert_eq!(cfg.shares, 6);
-        assert_eq!(cfg.threshold, 3);
-        assert_eq!(cfg.partners[0].project_id, "fhenix-507307");
-        assert_eq!(cfg.public_bucket, "fhenix-mainnet-keys");
-        for p in &cfg.partners {
-            assert!(
-                p.wip_audience
-                    .ends_with("/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider"),
-                "partner {} must write through the keygen pool, got {}",
-                p.project_id,
-                p.wip_audience
-            );
-        }
-    }
-
-    // Fail-closed: an env outside the baked map is rejected before any network call.
-    #[test]
-    fn unknown_env_fails_closed() {
-        assert!(Config::for_env("prod").is_err());
-        assert!(Config::for_env("").is_err());
-    }
-
-    #[test]
-    fn rejects_empty_partners() {
-        assert!(cfg(vec![], 0, 0).validate().is_err());
-    }
-
-    #[test]
-    fn rejects_partner_count_share_mismatch() {
-        let partners = (0..3).map(|i| partner(&format!("p{i}"))).collect();
-        assert!(cfg(partners, 5, 2).validate().is_err());
-    }
-
-    #[test]
-    fn rejects_duplicate_project_ids() {
-        let partners = vec![partner("dup"), partner("p1"), partner("dup")];
-        assert!(cfg(partners, 3, 2).validate().is_err());
-    }
-
-    #[test]
-    fn rejects_empty_wip_audience() {
-        let mut partners: Vec<PartnerCfg> = (0..5).map(|i| partner(&format!("p{i}"))).collect();
-        partners[2].wip_audience = String::new();
-        assert!(cfg(partners, 5, 2).validate().is_err());
-    }
-
-    #[test]
-    fn rejects_empty_project_id() {
-        let mut partners: Vec<PartnerCfg> = (0..5).map(|i| partner(&format!("p{i}"))).collect();
-        partners[0].project_id = String::new();
-        assert!(cfg(partners, 5, 2).validate().is_err());
-    }
-
-    #[test]
-    fn rejects_threshold_above_shares() {
-        let partners = (0..5).map(|i| partner(&format!("p{i}"))).collect();
-        assert!(cfg(partners, 5, 6).validate().is_err());
-    }
-
-    #[test]
-    fn rejects_zero_threshold() {
-        let partners = (0..5).map(|i| partner(&format!("p{i}"))).collect();
-        assert!(cfg(partners, 5, 0).validate().is_err());
-    }
-
-    #[test]
-    fn rejects_single_partner() {
-        // T = N = 1 is no longer valid: Gf256::combine_array needs >= 2 shares.
-        assert!(cfg(vec![partner("solo")], 1, 1).validate().is_err());
-    }
-
-    #[test]
-    fn accepts_minimum_two_of_two() {
-        cfg(vec![partner("a"), partner("b")], 2, 2)
-            .validate()
-            .unwrap();
-    }
 }

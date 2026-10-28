@@ -444,10 +444,12 @@ mod tests {
         let fixture = EnvConfig {
             partners,
             public_bucket: "b",
-            public_object: "p/0/public-material",
             public_prefix: "p",
             public_zone: 0,
             shamir_threshold: 2,
+            share_version: crate::envs::v(1),
+            reshare_from: None,
+            replace_live_keyset: false,
         };
         let env = &fixture;
         // `PartnerRef` is deliberately not `Debug`, so match rather than `expect_err`.
