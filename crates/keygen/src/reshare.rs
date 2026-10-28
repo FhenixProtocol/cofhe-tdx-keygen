@@ -15,7 +15,6 @@ use tracing::{info, warn};
 // publish a manifest that differs only in the per-share digests. The public
 // artifacts stay as they are: their bytes cannot be regenerated, and they do not
 // change.
-#[cfg(not(feature = "mock"))]
 pub(crate) async fn run_reshare(cfg: &Config, r: &ReshareSource, run: &Run) -> Result<()> {
     let manifest_object = r.manifest_object(cfg.env);
     info!(object = %manifest_object, "step 1: reading the live manifest and public artifacts");
@@ -124,7 +123,6 @@ pub(crate) async fn run_reshare(cfg: &Config, r: &ReshareSource, run: &Run) -> R
 }
 
 // The federated source partners, paired with their tokens, for one secret.
-#[cfg(not(feature = "mock"))]
 fn source_access<'a>(
     refs: &'a [PartnerRef],
     tokens: &'a [(usize, String)],
@@ -143,7 +141,6 @@ fn source_access<'a>(
 // signer anchor, a bucket writer could restore an older keyset's manifest and have
 // this run split that older key. The share-set check catches an env whose source
 // set is not the set the live manifest lists.
-#[cfg(not(feature = "mock"))]
 fn check_live_anchor(live: &PublicMaterial, r: &ReshareSource) -> Result<()> {
     let (decrypt, zk) = (r.decrypt_signer_address, r.zk_signer_address);
     if live.decrypt_signer_address != decrypt || live.zk_signer_address != zk {
@@ -166,7 +163,7 @@ fn check_live_anchor(live: &PublicMaterial, r: &ReshareSource) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, not(feature = "mock")))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Mode;
