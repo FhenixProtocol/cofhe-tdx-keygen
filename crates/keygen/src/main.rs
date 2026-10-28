@@ -1,14 +1,18 @@
-// Writer-only modules (binary-local); the reusable cloud clients + keygen live
-// in the lib crate (`cofhe_keys`) so the consumer reader can share them.
+// Binary-local modules; the reusable cloud clients, keygen and reader live in the
+// lib crate (`cofhe_keys`).
 #[cfg(not(feature = "mock"))]
 mod attestation;
 #[cfg(not(feature = "mock"))]
 mod gcp_auth;
 
 #[cfg(not(feature = "mock"))]
+mod ceremony;
+#[cfg(not(feature = "mock"))]
 mod config;
 #[cfg(not(feature = "mock"))]
 mod publish;
+#[cfg(not(feature = "mock"))]
+mod reshare;
 #[cfg(all(test, not(feature = "mock")))]
 mod test_support;
 #[cfg(not(feature = "mock"))]
@@ -24,17 +28,15 @@ use tracing_subscriber::EnvFilter;
 #[cfg(not(feature = "mock"))]
 use crate::attestation::AttestationClient;
 #[cfg(not(feature = "mock"))]
+use crate::ceremony::run_ceremony;
+#[cfg(not(feature = "mock"))]
 use crate::config::{Config, Mode};
 #[cfg(not(feature = "mock"))]
 use crate::gcp_auth::{GcpAuth, MetadataClient};
 #[cfg(not(feature = "mock"))]
-use crate::publish::{object_path, OBJ_CRS, OBJ_MANIFEST, OBJ_PUBLIC_KEY, OBJ_SERVER_KEY};
+use crate::reshare::run_reshare;
 #[cfg(not(feature = "mock"))]
-use crate::write::write_secret;
-#[cfg(not(feature = "mock"))]
-use anyhow::bail;
-#[cfg(not(feature = "mock"))]
-use cofhe_keys::{gcs::GcsClient, keygen, secrets::SecretManager};
+use cofhe_keys::{gcs::GcsClient, secrets::SecretManager};
 
 // Service endpoint constants — intentionally NOT read from the environment.
 // If an attacker with compute.instances.setMetadata could override these,
@@ -68,6 +70,12 @@ const WRITE_SECRET_FHE_PRIV: &str = "cofhe-tee-fhe-priv";
 #[cfg(not(feature = "mock"))]
 const WRITE_SECRET_ZK_SIGNER: &str = "cofhe-tee-zk-signer";
 
+// The keygen's reader name at each source partner: the `keygen-reader` provider.
+// It is enabled only for a reshare the partner approves (`grant_reshare_read`), so
+// the keygen image can read shares only during that window.
+#[cfg(not(feature = "mock"))]
+const KEYGEN_READER: &str = "keygen";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -91,166 +99,57 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// Production boot: generate + Shamir-split the keyset in-enclave -> for EACH
-// partner (attestation -> STS -> write its two share envelopes to its Secret
-// Manager) -> only then publish the public material + its provenance to our GCS
-// bucket -> exit. Secrets first across the WHOLE N×2 write set so the public
-// material is published only once every partner's (critical, cross-project,
-// attestation-gated) share delivery has succeeded. Each partner uses its OWN
-// attestation/federated token (no cross-partner token reuse). This is a one-shot
-// ceremony, not a long-running server. Direct federated grant: each attested federated
-// principal holds secretVersionAdder directly on its secrets, so the STS federated
-// token is used as the SM bearer as-is (no service-account impersonation).
+// Production boot: one-shot, then exit. A ceremony generates a new keyset; a
+// reshare splits the live keyset again for a new partner set. Both write every
+// partner's shares FIRST and publish the manifest LAST, so the manifest's presence
+// is a reliable signal that all shares were delivered. Any failure on the write
+// side crashes the run (via `?`) before the manifest changes.
 #[cfg(not(feature = "mock"))]
 async fn real_boot() -> Result<()> {
     let cfg = Config::from_env()?;
-    if let Mode::Reshare(r) = cfg.mode {
-        info!(share_version = %cfg.env.share_version, source_manifest = %r.manifest_object(cfg.env), "reshare target");
-        for s in r.partners {
-            info!(partner = %s.partner.project_id, share_version = %r.version_for(s.partner.project_id), "reshare source");
-        }
-        bail!(
-            "reshare image: this build validates a reshare config ({} sources, T={}, live signers {} and {}) but cannot run one",
-            r.partners.len(),
-            r.shamir_threshold,
-            r.decrypt_signer_address,
-            r.zk_signer_address
-        );
-    }
     info!(
+        reshare = matches!(cfg.mode, Mode::Reshare(_)),
         partners = cfg.partners.len(),
         shares = cfg.shares,
         threshold = cfg.threshold,
         fhe_priv_secret = %cfg.write_secret_fhe_priv,
         zk_signer_secret = %cfg.write_secret_zk_signer,
-        public_bucket = %cfg.public_bucket,
-        public_prefix = %cfg.public_prefix,
-        zone = cfg.zone,
-        "keygen ceremony starting"
+        public_bucket = %cfg.env.public_bucket,
+        public_prefix = %cfg.env.public_prefix,
+        zone = cfg.env.public_zone,
+        share_version = %cfg.env.share_version,
+        manifest = %cfg.env.manifest_object(),
+        "keygen starting"
     );
-
-    // Generate the full network keyset in-enclave (never leaves TDX memory
-    // unencrypted): FHE keys + decrypt_signer (TN) + zk_signer (ZK/verifier),
-    // Shamir-split N-of-T across the partners — one share pair per partner, index
-    // i → partners[i].
-    info!("step 1: generating + splitting network keyset in-enclave");
-    let partner_ids: Vec<String> = cfg.partners.iter().map(|p| p.project_id.clone()).collect();
-    let (partner_shares, artifacts, public) =
-        keygen::generate(&partner_ids, cfg.shares, cfg.threshold)?;
-
-    // Deliver the SECRET shares to EVERY partner FIRST — the cross-project,
-    // attestation-gated writes are the critical part. Each partner gets its own
-    // share of each per-audience secret, written to its OWN Secret Manager secret
-    // with its own provenance token (eat_nonce = SHA-256(share)), so the partner can
-    // grant each consumer least-privilege read via IAM: TeeCryptor reads fhe-priv
-    // (FHE priv + decrypt signer); the ZK verifier reads zk-signer. See
-    // CONSUMER-INTEGRATION.md.
-    //
-    // Per-partner attestation/token ISOLATION: each partner gets its OWN attestation
-    // (its wip_audience) → its OWN federated STS token, used as the SM bearer for
-    // ONLY that partner's two writes. A co-resident partner's token is never reused
-    // for another partner's project.
-    //
-    // Secrets-first invariant across the WHOLE N×2 write set: the public material is
-    // published only AFTER every partner's writes succeed (below). Any attestation /
-    // STS / SM failure crashes the run (via `?`) before anything is published, so the
-    // public material's presence is a reliable signal that all shares were delivered.
-    let attest = AttestationClient::new(ATTESTATION_SOCKET);
-    let auth = GcpAuth::new(STS_URL);
-    let sm = SecretManager::new(SM_URL);
-    let total = cfg.partners.len();
-    for (i, (partner, shares)) in cfg.partners.iter().zip(&partner_shares).enumerate() {
-        let n = i + 1;
-        info!(partner = %partner.project_id, step = %format!("{n}/{total}"), "fetching attestation token for partner");
-        let jwt = attest.fetch_token(&partner.wip_audience).await?;
-
-        info!(partner = %partner.project_id, "exchanging attestation for partner federated token");
-        let federated = auth.exchange(&partner.wip_audience, &jwt).await?;
-
-        info!(partner = %partner.project_id, secret = %cfg.write_secret_fhe_priv, "writing FHE-priv share (priv + decrypt signer)");
-        write_secret(
-            &attest,
-            &sm,
-            &federated,
-            &partner.project_id,
-            &cfg.write_secret_fhe_priv,
-            shares.fhe_priv_share.clone(),
-        )
-        .await?;
-
-        info!(partner = %partner.project_id, secret = %cfg.write_secret_zk_signer, "writing ZK-signer share");
-        write_secret(
-            &attest,
-            &sm,
-            &federated,
-            &partner.project_id,
-            &cfg.write_secret_zk_signer,
-            shares.zk_signer_share.clone(),
-        )
-        .await?;
+    let run = Run {
+        attest: AttestationClient::new(ATTESTATION_SOCKET),
+        auth: GcpAuth::new(STS_URL),
+        sm: SecretManager::new(SM_URL),
+        gcs: GcsClient::new(GCS_URL),
+        metadata: MetadataClient::new(METADATA_URL),
+    };
+    match cfg.mode {
+        Mode::Ceremony => run_ceremony(&cfg, &run).await,
+        Mode::Reshare(r) => run_reshare(&cfg, r, &run).await,
     }
+}
 
-    // All partner shares delivered — now publish the PUBLIC material to OUR bucket
-    // via the VM's compute SA (metadata token). The three FHE artifacts go to
-    // SEPARATE objects, named + laid out exactly as cofhe mounts them
-    // (keys/versionized/{zone}/…), so a cofhe stack reads this ceremony's keyset
-    // directly as files. The manifest (per-artifact + per-secret digests + signer
-    // addresses) sits alongside for the consumer reader; the provenance sidecar is
-    // still written but unread (kept for wire-format compatibility).
-    let sa_token = MetadataClient::new(METADATA_URL).token().await?;
-    let gcs = GcsClient::new(GCS_URL);
+// The cloud clients one run uses. The GCS bearer is the VM's attached service
+// account (in-project, no cross-project hop); partner bearers are per partner.
+#[cfg(not(feature = "mock"))]
+struct Run {
+    attest: AttestationClient,
+    auth: GcpAuth,
+    sm: SecretManager,
+    gcs: GcsClient,
+    // A fresh GCS bearer is fetched for each phase: a run can outlast one token.
+    metadata: MetadataClient,
+}
 
-    for (name, bytes) in [
-        (OBJ_SERVER_KEY, &artifacts.server_key),
-        (OBJ_PUBLIC_KEY, &artifacts.compact_public_key),
-        (OBJ_CRS, &artifacts.crs),
-    ] {
-        let object = object_path(&cfg.public_prefix, cfg.zone, name);
-        info!(object = %object, bytes = bytes.len(), "publishing public FHE artifact");
-        let written = gcs
-            .upload(&sa_token, &cfg.public_bucket, &object, bytes)
-            .await?;
-        info!(object = %written, "public FHE artifact written");
-    }
-
-    let manifest_object = object_path(&cfg.public_prefix, cfg.zone, OBJ_MANIFEST);
-    let public_bytes = public.to_canonical_bytes();
-    info!(object = %manifest_object, "publishing public-material manifest");
-    let written = gcs
-        .upload(
-            &sa_token,
-            &cfg.public_bucket,
-            &manifest_object,
-            &public_bytes,
-        )
-        .await?;
-    info!(object = %written, "public-material manifest written to our GCS bucket");
-
-    // Provenance for the manifest: mint an attestation whose eat_nonce binds
-    // SHA-256(manifest) and store it as a sidecar. Consumers no longer verify this
-    // sidecar (that check was removed — see the AGENTS.md invariant); the manifest's
-    // integrity now rests on the bucket's write IAM. Still written for wire-format
-    // compatibility.
-    let public_hash = hex::encode(public.hash());
-    info!(public_hash = %public_hash, "minting public-material provenance (eat_nonce = SHA-256(manifest))");
-    let public_provenance_jwt = attest
-        .fetch_token_with_nonces(PROVENANCE_AUDIENCE, &[public_hash])
-        .await?;
-    let prov_object = format!("{manifest_object}.provenance");
-    let written = gcs
-        .upload(
-            &sa_token,
-            &cfg.public_bucket,
-            &prov_object,
-            public_provenance_jwt.as_bytes(),
-        )
-        .await?;
-    info!(object = %written, "public-material provenance written to our GCS bucket");
-
-    info!(
-        decrypt_signer = %public.decrypt_signer_address,
-        zk_signer = %public.zk_signer_address,
-        "keygen ceremony complete"
-    );
-    Ok(())
+// Attest for one audience and exchange the token at STS. Each partner gets its
+// OWN attestation and federated token; a token is never reused across partners.
+#[cfg(not(feature = "mock"))]
+async fn federate(run: &Run, audience: &str) -> Result<String> {
+    let jwt = run.attest.fetch_token(audience).await?;
+    run.auth.exchange(audience, &jwt).await
 }

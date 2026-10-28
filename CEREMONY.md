@@ -12,7 +12,8 @@ behind each step is in [`DESIGN.md`](DESIGN.md), and the consumer read path is i
 [`CONSUMER-INTEGRATION.md`](CONSUMER-INTEGRATION.md).
 
 **Shipping a new consumer image into an environment that already runs is not a
-ceremony.** That path re-pins a digest and rolls the consumers. It needs no new keys, so
+ceremony.** That path uses tags A and B (§5): it re-pins a digest and rolls the
+consumers. It needs no new keys, so
 the keyset, both signer addresses and the client-key hash all stay byte-identical.
 
 ---
@@ -79,7 +80,9 @@ environment's partner set.
 **Write access is opt-in and the partner controls it.** `grant_write_access` defaults to
 `false`, which is the steady state, because key creation is bootstrap-only. A partner
 passes `true` for the ceremony apply and drops it afterwards, which re-freezes the
-secrets and keeps both the secret and the pool in place.
+secrets and keeps both the secret and the pool in place. While the flag is on, the
+module also binds `roles/secretmanager.viewer` on both secrets to the same principal.
+The run uses it to list version numbers before any write. It never reads a payload.
 
 ### Step 2 — Build the image through the release workflow
 
@@ -145,10 +148,33 @@ The partner set, the Shamir N and T, the secret ids, and the public bucket and p
 They are not deployment variables. Changing any of them is a rebuild plus a partner
 re-pin. The selector fails closed on any value outside the baked map.
 
+A ceremony refuses to run while any object exists under the `public-material` prefix
+at that bucket and zone (the legacy name or any `.v{N}`). So an image built from the
+wrong env cannot replace a live keyset. A deliberate key
+rotation bakes `replace_live_keyset: true` in the env, and that needs review like any
+other env change. After the rotation, set it back to `false` and release, so the
+guard is on again for the next image.
+
 Inside the VM, the run does five things, and each is visible in the log: fetch the
 attestation token, generate the keyset, Shamir-split each secret, write one share per
 partner through that partner's gate, and publish the public material and digests. It
 then logs `keygen ceremony complete` and exits.
+
+Each share goes to the env's baked `share_version`, the same number at every partner.
+Secret Manager does not let a writer choose a number, so the write path is:
+
+1. **Precheck.** List both secrets at every partner, all states. If any newest number
+   is at or above the target, stop before any write.
+2. **Fillers.** Where the newest number is below target−1, add filler versions (the
+   bytes `de ad be ef`) up to target−1. A filler is not an envelope, so a read of one
+   fails closed.
+3. **Shares.** Write each real share at the target.
+
+Every returned number is checked, and a wrong one stops the run. There is no retry,
+and the Secret Manager timeout is 1800 s. Run one keygen per env at a time: two
+runs at once both pass the precheck, and the last manifest wins. The manifest goes last, to
+`public-material.v{N}`. Its `.provenance` sidecar goes just before it, so a stop
+never leaves a manifest without its sidecar.
 
 On a clean exit the launcher shuts the VM down, so the instance ends up `TERMINATED`.
 That is success. A crash looks the same from outside the VM, so confirm the run through
@@ -169,7 +195,9 @@ Verification has two layers, and the `verify` CLI runs both.
 
 **A. Per-partner envelope decode.** Read one partner's share back, decode the envelope,
 and hash the payload. The hash must equal the `share_hash` that the VM logged for that
-partner and the per-share digest in the published material. `verify` fetches no JWKS and
+partner and the per-share digest in the published material. This default `verify` mode
+needs `--version <N>` and `--public-object <manifest of version N>`; it has no default
+and no `latest`. `verify` fetches no JWKS and
 verifies no attestation token: that consumer-side check was removed, and share
 authenticity rests on the partner's write-gate instead (`DESIGN.md` §7).
 
@@ -181,8 +209,14 @@ authenticity rests on the partner's write-gate instead (`DESIGN.md` §7).
 > removal rather than assuming it.
 
 > **On a real network, verify without reading.** The ceremony is all-or-nothing, so the
-> completion line already proves every write landed. Version **metadata** confirms one
-> new version per partner. The end-to-end proof is a consumer booting, reconstructing
+> completion line already proves every write landed. Version **metadata** confirms the
+> result: on every partner, the newest version of both secrets equals the baked
+> `share_version`. Read the baked number from `share_version: v(N)` in
+> `crates/cofhe-keys/src/envs/<env>.rs` at the released commit, or from the
+> `keygen starting` log line. Then, for each partner and each secret, run
+> `gcloud secrets versions list <secret> --project=<partner project> --sort-by=~createTime --limit=1 --format='value(name.basename())'`.
+> Each output must equal N.
+> The end-to-end proof is a consumer booting, reconstructing
 > T-of-N in-enclave, and matching the published signer address.
 
 **B. Live T-of-N reconstruct** (`verify reconstruct`). This is the consumer-side check.
@@ -243,5 +277,149 @@ The shipped defaults suit development. A real deployment adds all four.
 - **Who runs the partner stack.** In production the partner runs it in their own project.
   An environment where we own the partner projects **demonstrates** the model; it does
   not enforce it, because we are owners there.
-- **Live key rotation is future work.** Today a re-run appends a fresh keyset as a new
-  secret version across all partners, which invalidates existing ciphertexts.
+- **A re-run over a live keyset is refused** (Step 4). A deliberate key rotation writes
+  a fresh keyset to all partners, which invalidates existing ciphertexts.
+
+## 5. Reshare — change the partner set, keep the keyset
+
+Use a reshare to add or replace a key-share holder. Do not use it after a suspected
+leak: old shares still rebuild the key. Run a new ceremony instead.
+
+A reshare reads the shares at version N on the source partners. It writes version M
+on the target partners and publishes `public-material.v{M}`. It never deletes
+`public-material.v{N}`. So old consumers (vN) and new consumers (vM) run side by side,
+and a restart works for both. There is no maintenance window. The rationale is in
+[`DESIGN.md`](DESIGN.md) §5.
+
+1. **Bake the change** in `crates/cofhe-keys/src/envs/<env>.rs`:
+   - Copy the live set into `reshare_from`, with its threshold, its `share_version`
+     and the two live signer addresses (they are on-chain). Write the source entries
+     in full. Do not point them at `PARTNERS`: you edit `PARTNERS` to the target set.
+   - A source partner at another version gets
+     `SourcePartner { partner, share_version: Some(v(N)) }`.
+   - Set `partners` and `shamir_threshold` to the target set.
+   - Raise `share_version` to the target. It must be above every source version.
+
+   An env with `reshare_from` builds a reshare-only image: it can never run a
+   ceremony. CI checks the env, and fails if any env's `share_version` goes down
+   against `main`. Release the image (Step 2).
+2. **Rebuild the consumers** with the new `cofhe-keys`. They read the new
+   `share_version` and its manifest. Do not deploy them yet.
+3. **Tag A.** Cut a `key-share-holders` release with `keep_previous_readers = true`.
+   Each reader then allows its running digest and its new digest. Partners apply it:
+   - A source partner that stays: `grant_reshare_read = true` and
+     `grant_write_access = true`.
+   - A source partner that leaves: `grant_reshare_read = true`. This is optional: the
+     run needs only the old threshold of sources.
+   - A source partner's read needs `grant_read_access = true` too: that flag is the
+     read brake, and it also disables the keygen gate.
+   - A new partner: onboard (Step 1) with `grant_write_access = true`.
+   - Every partner pins the new keygen digest (Step 3).
+4. **Run** with `run_ceremony = true`. The image runs the reshare. The log names
+   each source share version it read (`"read share"` lines). Before it writes, the
+   run checks the rebuilt key against the published keys and signers. To check the
+   source shares by hand first, build `verify` from the `main` commit that the live
+   consumers were built from (before the env change):
+   - A unity build (it has `--version`):
+     `verify reconstruct --env <env> --threshold <old T> --token "$(gcloud auth print-access-token)" --check-keys`.
+   - A pre-unity build has no `--version` and no `--check-keys`. It reads each
+     partner's newest version and the legacy manifest, and checks the digests only:
+     `verify reconstruct --env <env> --threshold <old T> --token "$(gcloud auth print-access-token)"`.
+
+   For a same-set change, the new build also works with `--version <N>`. It then
+   reads `public-material.v{N}`; give `--public-object` for another name. In the
+   staging migration, use `--version 5 --public-object <prefix>/<zone>/public-material`.
+   One `--version` cannot express the partner-1 override (v8), so partner-1 drops
+   out as a liar. The check still passes on the other 4 partners (T=2). The run then
+   writes at M as in §2 Step 4, and publishes `public-material.v{M}` last.
+5. **Roll the consumers** to the rebuilt images. Old pods keep working on vN and
+   `.vN` until they are replaced. Confirm a decrypt and a ZK verification.
+6. **Tag B.** Set `run_ceremony = false`. Cut a release with
+   `keep_previous_readers = false`, and partners set `grant_reshare_read` and
+   `grant_write_access` back to `false`. The old digests lose their read, and the
+   keygen loses its read, list and write. Remove `reshare_from` and release.
+7. **Keep the old versions and manifests.** No partner destroys a secret version, and
+   no one deletes a manifest. Recovery and rollback need them. If Fhenix later wants
+   an old share gone, it asks that partner explicitly, and the partner removes it by
+   hand.
+
+A plain consumer image upgrade uses the same tags A and B, with the reshare flags off.
+
+**An open overlap keeps its running image.** While a reader lists two digests, the
+older one stays until a tag B retires it. A new tag A (a rerun or a fix-forward) then
+gives `[new, running]`, so the running consumers keep their read. Apply tag B only
+after a successful roll, and before the next upgrade.
+
+**Do not delete a pinned image** from the registry. Every partner apply proves each
+pinned digest against its public provenance.
+
+**Rules for every env:**
+
+- Deploy a unity consumer only after its env has `public-material.v{share_version}`.
+- Roll all consumers to unity images before the env's first non-legacy reshare. That
+  reshare does not update the legacy `public-material`, so a legacy reader would fail.
+
+### Recovery
+
+A run that stops after its first write ends with an error that carries a recovery
+report (also logged as `run stopped; recovery report`). The report lists each share
+the run wrote with its version, the filler count per partner and secret, and each
+`public-material` object (manifest or sidecar) it already published. The old version and its manifest are
+untouched. So, for a reshare and for a first ceremony, consumers that read the baked
+version are not affected, and a restart works. A
+`replace_live_keyset` rotation says instead that the shared artifacts may already be
+overwritten: rotation recovery is out of scope here.
+
+A first ceremony that stopped in the publish step left a `public-material` object, so
+the replace guard stops its rerun: bake `replace_live_keyset: true` for the rerun, then
+set it back to `false`.
+
+A precheck stop gets no report. Nothing is written, and the error says what to do:
+bake a higher `share_version`.
+
+In the staging migration, a stop can fall between `public-material.v9` and the legacy
+`public-material`. A rerun at a higher version publishes both names again. This run
+overwrites the legacy `public-material` that legacy consumers read, so its report
+does not say "untouched". Compare `public-material` with `public-material.v9` by md5.
+If they are equal, the run published: do not rerun. Legacy consumers that read
+`latest` may already see v9.
+
+| The report says | What to do |
+|---|---|
+| no share written | Rerun the same image: the fillers stop at target−1, so the target is still free. If the last write timed out, it can still have created a version; then the precheck stops the rerun, and you need a higher `share_version`. |
+| shares written | They are orphans: no reader reads M before an image with M is deployed. Build a new image whose `share_version` is above the highest version listed, and rerun. A version number is never reused. |
+
+The VM runs its container once, so a rerun is `run_ceremony = false`, apply, then
+`run_ceremony = true`, apply. A new image needs a new tag A first, so partners pin
+the new keygen digest (Step 3). A reshare rerun rebuilds the key from vN again,
+splits it with fresh randomness, and writes at the new target. The orphans stay as
+older versions that no reader uses.
+
+**A rerun of a finished run** stops at the precheck: every partner is already at the
+target.
+
+Do not disable or destroy a secret version to recover. Every reader reads an exact
+number, and the run never reuses one.
+
+**To roll back** after a finished reshare, repin the old consumer digests (a
+`key-share-holders` release with them). They read vN and `.vN`, which still exist. A
+removed partner must still hold its secret and its read gate for this. A reshare back
+(`reshare_from` = the new set, `partners` = the old set, a higher `share_version`)
+also works and uses the same path.
+
+### Migration to unity versions (one time per env)
+
+- **Testnet and mainnet: no reshare.** All partners are at v1. The env bakes
+  `share_version: v(1)` with no `reshare_from`. An operator copies `public-material`
+  to `public-material.v1`, and `public-material.provenance` to
+  `public-material.v1.provenance`, once. The bytes are the same. No share and no
+  existing object changes, so today's readers keep working. The commands are in
+  the gitops `tee/cofhe-tdx-keygen/CLOUD_RUNBOOK.md`, Step 6c.
+- **Staging: one migration reshare.** The same partner set, source v5, a partner-1
+  override of v8, target v9, and `legacy_manifest: true`. It reads the legacy
+  `public-material`, writes v9 at all partners, publishes `public-material.v9`, and
+  writes the same bytes to `public-material`.
+  - Do not restart a consumer from the first filler to the publish. In that window,
+    a legacy consumer's `latest` is a filler or a share that the legacy manifest does
+    not list.
+  - If the run stops, rerun at once with a higher `share_version`.

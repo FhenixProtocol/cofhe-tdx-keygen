@@ -84,6 +84,38 @@ impl GcsClient {
         Ok(format!("{}#{}", parsed.name, parsed.generation))
     }
 
+    /// The first object name under `prefix`. A missing bucket is an error, not an
+    /// empty listing: a typo in a bucket name must never pass for "no live keyset".
+    pub async fn first_with_prefix(
+        &self,
+        access_token: &str,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Option<String>> {
+        // Only the first page: the caller needs one name.
+        #[derive(Deserialize)]
+        struct Listing {
+            #[serde(default)]
+            items: Vec<ObjectResponse>,
+        }
+        let url = format!("{}/storage/v1/b/{}/o", self.base_url, bucket);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("prefix", prefix), ("fields", "items(name)")])
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .context("GCS list request failed")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            bail!("GCS list {} — {}", status, text);
+        }
+        let listing: Listing = resp.json().await.context("parse GCS listing")?;
+        Ok(listing.items.into_iter().next().map(|o| o.name))
+    }
+
     /// Download an object's bytes (latest live generation) via the GCS JSON API
     /// media download. Used by the consumer reader to fetch the public material.
     /// `object_name` is percent-encoded into the single path segment, so names
@@ -174,6 +206,40 @@ mod tests {
             .await;
         let gcs = GcsClient::new(server.uri());
         assert!(gcs.upload("t", "b", "o", b"x").await.is_err());
+    }
+
+    // The ceremony guard: any object under the prefix is a live manifest; an empty
+    // listing is none; a missing bucket stops the run instead of passing for "none".
+    #[tokio::test]
+    async fn first_with_prefix_finds_any_and_fails_on_a_missing_bucket() {
+        let server = MockServer::start().await;
+        for (bucket, status, items) in [
+            (
+                "live",
+                200,
+                serde_json::json!({"items": [{"name": "p/0/public-material.v3"}]}),
+            ),
+            ("empty", 200, serde_json::json!({})),
+            ("missing", 404, serde_json::json!({})),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/storage/v1/b/{bucket}/o")))
+                .and(query_param("prefix", "p/0/public-material"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(items))
+                .mount(&server)
+                .await;
+        }
+        let gcs = GcsClient::new(server.uri());
+        let prefix = "p/0/public-material";
+        assert_eq!(
+            gcs.first_with_prefix("t", "live", prefix).await.unwrap(),
+            Some("p/0/public-material.v3".to_string())
+        );
+        assert_eq!(
+            gcs.first_with_prefix("t", "empty", prefix).await.unwrap(),
+            None
+        );
+        assert!(gcs.first_with_prefix("t", "missing", prefix).await.is_err());
     }
 
     #[tokio::test]

@@ -37,7 +37,8 @@ base64 = "0.22"
 vsss-rs = { version = "5.4", default-features = false, features = ["std", "zeroize"] }
 # Read-side only: `futures::future::join_all` for the fault-tolerant fetch-all-N
 # gather (every partner resolves, one failure never aborts the batch). Gated
-# behind `reader` so the enclave `keygen` writer build keeps it out of the TCB.
+# behind `reader`, so a writer-only build skips it. The keygen image enables `reader`
+# for a reshare.
 futures = { version = "0.3", optional = true }
 hex = "0.4"
 # Percent-encode the object name into the GCS download URL path. Object names now
@@ -61,7 +62,8 @@ sha3 = "0.10"
 # serializes the FHE keyset. Optional so reader-only consumers skip this heavy compile.
 tfhe = { version = "=1.5.1", features = ["integer", "zk-pok"], optional = true }
 # Read-side only: `tokio::time::timeout` for the per-partner read-gather timeout.
-# Gated behind `reader` so the enclave `keygen` writer build keeps it out of the TCB.
+# Gated behind `reader`, so a writer-only build skips it. The keygen image enables `reader`
+# for a reshare.
 tokio = { version = "1", features = ["time"], optional = true }
 # Pin transitive: tfhe-zk-pok 0.8.2 drags in tfhe-versionable 0.8.0 (skewing
 # against tfhe's own 0.7.0 and breaking the build). 0.8.0 is what TN/fhe-engine
