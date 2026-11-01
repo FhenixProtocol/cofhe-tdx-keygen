@@ -1,0 +1,30 @@
+name: slow tests
+
+# The tests marked `#[ignore]` generate a real keyset, which takes minutes per
+# test, so ci.yml skips them. Start this run by hand before a release that changes
+# the reshare path. It is a separate workflow because the release gate requires
+# every job in ci.yml to pass, and a skipped job would fail that gate.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  real-keyset:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      # `rustup show` reads rust-toolchain.toml and installs the pinned channel.
+      - name: Install toolchain
+        run: rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+
+      - name: real-keyset tests
+        run: cargo test -p keygen --release -- --ignored

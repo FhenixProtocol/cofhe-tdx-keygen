@@ -490,7 +490,8 @@ Four layers, cheapest first. The first three run on a laptop with no cloud.
    checked before any write, and a ceremony stops over a live manifest.
    The tests marked `#[ignore]` generate a real keyset: the whole reshare, its stops,
    the old and new readers, and the staging migration. CI skips them. Run them with
-   `cargo test -p keygen -- --ignored` before a release that changes the reshare path.
+   `cargo test -p keygen --release -- --ignored`, or start the `slow tests` workflow by
+   hand, before a release that changes the reshare path.
 3. **A mock run** (`make run-local`) runs the real `generate()` end to end on a laptop,
    with no attestation and no writes.
 4. **The cloud round-trip** is the acceptance gate before a production deploy, because it
