@@ -1,7 +1,7 @@
 use crate::attestation::AttestationClient;
 use crate::config::{Config, Mode};
 use crate::{federate, Run, PROVENANCE_AUDIENCE};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use cofhe_keys::keygen;
 use cofhe_keys::secrets::{self, SecretManager};
 use cofhe_keys::serialization::{sha256, SecretEnvelope};
@@ -60,11 +60,7 @@ pub(crate) async fn deliver_shares(
         for (s, &n) in secret_ids.into_iter().zip(newest) {
             for expected in n + 1..target {
                 info!(partner = %p, secret = %s, version = expected, "writing filler");
-                let name = run
-                    .sm
-                    .add_version(token, p, s, FILLER)
-                    .await
-                    .map_err(|e| e.context(AddFailed))?;
+                let name = run.sm.add_version(token, p, s, FILLER).await?;
                 let got = secrets::version_number(&name)?.get();
                 record(written, p, s, expected, got, true)?;
             }
@@ -79,7 +75,7 @@ pub(crate) async fn deliver_shares(
         {
             info!(partner = %p, secret = %s, version = target, "writing share");
             let name = write_secret(&run.attest, &run.sm, token, p, s, share.clone()).await?;
-            let got = secrets::version_number(&name).context(AddFailed)?.get();
+            let got = secrets::version_number(&name)?.get();
             record(written, p, s, target, got, false)?;
         }
     }
@@ -118,17 +114,6 @@ pub(crate) struct Written {
     filler: bool,
 }
 
-// Marks an error from a Secret Manager add: the add may still have created the
-// version, so the report cannot promise that the target is free.
-#[derive(Debug)]
-struct AddFailed;
-
-impl std::fmt::Display for AddFailed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("a Secret Manager add failed")
-    }
-}
-
 // Marks the precheck stop: nothing is written, and the error itself says what to
 // do, so it gets no recovery report.
 #[derive(Debug)]
@@ -151,32 +136,54 @@ pub(crate) fn with_report(
     if e.downcast_ref::<PrecheckStop>().is_some() {
         return e;
     }
-    let in_add = e.downcast_ref::<AddFailed>().is_some();
-    let report = recovery_report(cfg, written, published, in_add);
+    let report = recovery_report(cfg, written, published);
     tracing::error!(report = %report, "run stopped; recovery report");
     e.context(report)
 }
 
 // What a stopped run leaves behind, and how to rerun. `published` lists the
-// public-material objects this run already wrote; `in_add` says the run stopped
-// inside an add.
-fn recovery_report(
-    cfg: &Config,
-    written: &[Written],
-    published: &[String],
-    in_add: bool,
-) -> String {
+// public-material objects this run already wrote.
+fn recovery_report(cfg: &Config, written: &[Written], published: &[String]) -> String {
     let target = cfg.env.share_version.get();
+    let (versioned, legacy) = (cfg.env.manifest_object(), cfg.env.legacy_manifest_object());
+    // The versioned manifest is up, so the shares are live under the target and a
+    // rerun only burns a version. The legacy name gets the same bytes: copy them.
+    let copy_legacy = !cfg.env.replace_live_keyset
+        && matches!(cfg.mode, Mode::Reshare(r) if r.legacy_manifest)
+        && published.contains(&versioned)
+        && !published.contains(&legacy);
     let mut lines = vec![match cfg.mode {
         _ if cfg.env.replace_live_keyset => "This run replaces the live keyset: the shared public artifacts may already be overwritten. Rotation recovery is out of scope.".to_string(),
+        _ if copy_legacy => {
+            let gs = |o: &str| format!("gs://{}/{o}", cfg.env.public_bucket);
+            let pairs = [
+                (format!("{versioned}.provenance"), format!("{legacy}.provenance")),
+                (versioned.clone(), legacy.clone()),
+            ];
+            let mut text = format!(
+                "The run published version {target}: do not rerun. Only the legacy names are missing. \
+                 Copy the versioned manifest and its sidecar to the legacy names:"
+            );
+            for (from, to) in &pairs {
+                text += &format!("\n  gcloud storage cp {} {}", gs(from), gs(to));
+            }
+            text += "\nThen check that the md5 of each pair is equal:";
+            for o in pairs.iter().flat_map(|(from, to)| [from, to]) {
+                text += &format!(
+                    "\n  gcloud storage objects describe {} --format='value(md5_hash)'",
+                    gs(o)
+                );
+            }
+            text
+        }
         // The legacy manifest is what legacy consumers read, and this run overwrites
         // it; a lost upload response can hide a finished publish.
         Mode::Reshare(r) if r.legacy_manifest => format!(
             "This run also writes the legacy manifest. Compare {} with {} (md5 or bytes). \
              If they are equal, the run published: do not rerun. \
              Legacy consumers read the newest share version, so they may already see version {target}.",
-            cfg.env.legacy_manifest_object(),
-            cfg.env.manifest_object(),
+            legacy,
+            versioned,
         ),
         _ => "The old version and its manifest are untouched, so consumers that read the baked version are not affected.".to_string(),
     }];
@@ -207,15 +214,16 @@ fn recovery_report(
         }
     }
     match written.iter().map(|w| w.version).max() {
+        _ if copy_legacy => {}
         Some(highest) if highest >= target => lines.push(format!(
             "These versions are orphans that no reader reads. To rerun, build a new image whose share_version is above {highest}."
         )),
-        _ if in_add => lines.push(
-            "Rerun the same image: the target version is still free — unless the last write \
-             timed out; then the precheck stops, and a higher share_version is needed."
+        // A timed-out add can still create a share that this run never recorded.
+        // The rerun precheck sees it and names its version.
+        _ => lines.push(
+            "Rerun the same image. If its precheck stops, bake a share_version above the version it names."
                 .to_string(),
         ),
-        _ => lines.push("Rerun the same image: the target version is still free.".to_string()),
     }
     lines.join("\n")
 }
@@ -247,8 +255,7 @@ async fn write_secret(
             secret,
             &envelope.to_canonical_bytes(),
         )
-        .await
-        .map_err(|e| e.context(AddFailed))?;
+        .await?;
     info!(secret = %secret, version = %version, "secret written to partner Secret Manager");
     Ok(version)
 }
@@ -415,7 +422,7 @@ mod tests {
     // A share add that returns a name without a version number may still have
     // created the target, so the report must not promise a free target.
     #[tokio::test]
-    async fn a_bad_name_after_a_share_add_is_an_add_failure() {
+    async fn a_bad_name_after_a_share_add_gets_the_one_rerun_rule() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
         let (w, cfg) = write_setup(2, [Some(1), Some(1)]).await;
@@ -434,7 +441,11 @@ mod tests {
             .unwrap_err();
         let err = format!("{:#}", with_report(err, &cfg, &written, &[]));
         assert!(err.contains("not a numbered secret version name"), "{err}");
-        assert!(err.contains("unless the last write timed out"), "{err}");
+        assert!(
+            err.contains("If its precheck stops, bake a share_version above"),
+            "{err}"
+        );
+        assert!(!err.contains("still free"), "{err}");
     }
 
     // D5: a stop before any real share reruns the same image; a stop after one
@@ -461,29 +472,17 @@ mod tests {
         };
         let ceremony = at5(env(set(&[P1, P2]), 2, None), false);
 
-        let fillers_only = recovery_report(&ceremony, &[w(4, true)], &[], false);
-        assert!(
-            fillers_only.contains("Rerun the same image: the target version is still free."),
-            "{fillers_only}"
-        );
-        assert!(!fillers_only.contains("timed out"), "{fillers_only}");
+        // A stop before any share may still have created a share (a timed-out add),
+        // so one rule covers it: the rerun precheck tells the two cases apart.
+        let fillers_only = recovery_report(&ceremony, &[w(4, true)], &[]);
+        assert!(fillers_only.contains("Rerun the same image. If its precheck stops, bake a share_version above the version it names."), "{fillers_only}");
+        assert!(!fillers_only.contains("still free"), "{fillers_only}");
         assert!(
             fillers_only.to_lowercase().contains(untouched),
             "{fillers_only}"
         );
 
-        // A failed add may still have created the version, so the plain rerun
-        // advice gets its exception.
-        let add_failed = recovery_report(&ceremony, &[w(4, true)], &[], true);
-        assert!(
-            add_failed.contains(
-                "Rerun the same image: the target version is still free — unless the last write \
-                 timed out; then the precheck stops, and a higher share_version is needed."
-            ),
-            "{add_failed}"
-        );
-
-        let with_share = recovery_report(&ceremony, &[w(4, true), w(5, false)], &[], true);
+        let with_share = recovery_report(&ceremony, &[w(4, true), w(5, false)], &[]);
         for s in [
             "p1 cofhe-tee-fhe-priv version 5 (share)",
             "1 filler version(s)",
@@ -501,11 +500,11 @@ mod tests {
         // reshare has no guard.
         let sidecar = ["p/0/public-material.v5.provenance".to_string()];
         let guard = "a rerun of this ceremony needs replace_live_keyset: true";
-        let half_published = recovery_report(&ceremony, &[w(5, false)], &sidecar, false);
+        let half_published = recovery_report(&ceremony, &[w(5, false)], &sidecar);
         assert!(half_published.contains(&sidecar[0]), "{half_published}");
         assert!(half_published.contains(guard), "{half_published}");
         let reshare = at5(replace_env(), false);
-        let half_published = recovery_report(&reshare, &[w(5, false)], &sidecar, false);
+        let half_published = recovery_report(&reshare, &[w(5, false)], &sidecar);
         assert!(half_published.contains(&sidecar[0]), "{half_published}");
         assert!(!half_published.contains(guard), "{half_published}");
 
@@ -514,7 +513,6 @@ mod tests {
             &at5(env(set(&[P1, P2]), 2, None), true),
             &[w(5, false)],
             &[],
-            false,
         );
         assert!(!rotation.to_lowercase().contains(untouched), "{rotation}");
         assert!(
@@ -542,13 +540,58 @@ mod tests {
         let untouched = "untouched";
         let compare = "Compare p/0/public-material with p/0/public-material.v2 (md5 or bytes). \
              If they are equal, the run published: do not rerun.";
-        let legacy = recovery_report(&cfg(true), &[], &[], false);
+        let legacy = recovery_report(&cfg(true), &[], &[]);
         assert!(!legacy.contains(untouched), "{legacy}");
         assert!(!legacy.contains("not affected"), "{legacy}");
         assert!(legacy.contains(compare), "{legacy}");
         assert!(legacy.contains("may already see version 2"), "{legacy}");
-        let normal = recovery_report(&cfg(false), &[], &[], false);
+        let normal = recovery_report(&cfg(false), &[], &[]);
         assert!(normal.contains(untouched), "{normal}");
         assert!(!normal.contains("Compare"), "{normal}");
+    }
+
+    // A stop after the versioned manifest lands, before the legacy name: the shares
+    // are live under v{target}, so a rerun only burns a version. The legacy name
+    // gets the same bytes, so a copy finishes the run.
+    #[test]
+    fn a_legacy_migration_stopped_before_the_legacy_name_says_copy() {
+        let r = replace_env().reshare_from.as_ref().unwrap();
+        let cfg = Config::from_env_config(Box::leak(Box::new(EnvConfig {
+            reshare_from: Some(ReshareSource {
+                legacy_manifest: true,
+                ..*r
+            }),
+            ..*replace_env()
+        })))
+        .unwrap();
+        let share = Written {
+            partner: "p1".to_string(),
+            secret: WRITE_SECRET_FHE_PRIV.to_string(),
+            version: 2,
+            filler: false,
+        };
+        let published = [
+            "p/0/public-material.v2.provenance".to_string(),
+            "p/0/public-material.v2".to_string(),
+        ];
+        let report = recovery_report(&cfg, std::slice::from_ref(&share), &published);
+        for s in [
+            "The run published version 2: do not rerun.",
+            "gcloud storage cp gs://b/p/0/public-material.v2.provenance gs://b/p/0/public-material.provenance",
+            "gcloud storage cp gs://b/p/0/public-material.v2 gs://b/p/0/public-material",
+            "gcloud storage objects describe gs://b/p/0/public-material --format='value(md5_hash)'",
+        ] {
+            assert!(report.contains(s), "{report}");
+        }
+        assert!(!report.contains("orphans"), "{report}");
+        assert!(!report.contains("Rerun the same image"), "{report}");
+
+        // Once the legacy name is up too, the compare rule stays.
+        let mut all = published.to_vec();
+        all.push("p/0/public-material.provenance".to_string());
+        all.push("p/0/public-material".to_string());
+        let report = recovery_report(&cfg, std::slice::from_ref(&share), &all);
+        assert!(report.contains("Compare"), "{report}");
+        assert!(!report.contains("gcloud storage cp"), "{report}");
     }
 }

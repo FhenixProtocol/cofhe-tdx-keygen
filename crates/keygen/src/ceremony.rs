@@ -163,7 +163,7 @@ mod tests {
         let err = format!("{:#}", run_ceremony(&cfg, &w.run).await.unwrap_err());
         for s in [
             "p-2 cofhe-tee-zk-signer: 1 filler version(s)",
-            "Rerun the same image: the target version is still free — unless the last write timed out",
+            "Rerun the same image. If its precheck stops, bake a share_version above the version it names.",
         ] {
             assert!(err.contains(s), "{err}");
         }
