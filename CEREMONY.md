@@ -189,7 +189,8 @@ authenticity rests on the partner's write-gate instead (`DESIGN.md` §7).
 It wraps the same reader the consumers embed, so it fetches all N shares, filters liars
 by per-share digest, reconstructs from T, and validates the result against the published
 full-key digest. The partner set comes from the baked environment map, selected with
-`--env`, and there is no flag that points the CLI at an ad-hoc partner list.
+`--env`, and there is no flag that points the CLI at an ad-hoc partner list. `--version`
+names the exact share version to read; there is no `latest`.
 
 What the two layers prove, in order:
 
