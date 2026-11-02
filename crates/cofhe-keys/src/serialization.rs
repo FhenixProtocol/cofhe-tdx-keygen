@@ -261,6 +261,21 @@ pub struct PublicMaterial {
 }
 
 impl PublicMaterial {
+    /// The same manifest for a new partner set: every field stays, except the two
+    /// per-share digest lists. A reshare publishes this, so readers reject every
+    /// share that is not part of the new split.
+    pub fn with_share_digests(
+        &self,
+        fhe_priv_share_digests: Vec<(String, [u8; 32])>,
+        zk_signer_share_digests: Vec<(String, [u8; 32])>,
+    ) -> Self {
+        Self {
+            fhe_priv_share_digests,
+            zk_signer_share_digests,
+            ..self.clone()
+        }
+    }
+
     pub fn to_canonical_bytes(&self) -> Vec<u8> {
         let mut out = vec![PUBLIC_VERSION];
         put_field(&mut out, &self.server_key_digest);
@@ -393,6 +408,36 @@ impl SecretEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_share_digests_changes_only_the_two_lists() {
+        let old = PublicMaterial {
+            server_key_digest: [1; 32],
+            compact_public_key_digest: [2; 32],
+            crs_digest: [3; 32],
+            decrypt_signer_address: "0xaa".into(),
+            zk_signer_address: "0xbb".into(),
+            fhe_priv_digest: [4; 32],
+            zk_signer_digest: [5; 32],
+            fhe_priv_share_digests: vec![("old".into(), [6; 32])],
+            zk_signer_share_digests: vec![("old".into(), [7; 32])],
+        };
+        let fhe = vec![
+            ("new-1".to_string(), [8; 32]),
+            ("new-2".to_string(), [9; 32]),
+        ];
+        let zk = vec![
+            ("new-1".to_string(), [10; 32]),
+            ("new-2".to_string(), [11; 32]),
+        ];
+        let new = old.with_share_digests(fhe.clone(), zk.clone());
+        assert_eq!(new.fhe_priv_share_digests, fhe);
+        assert_eq!(new.zk_signer_share_digests, zk);
+        let mut back = new.clone();
+        back.fhe_priv_share_digests = old.fhe_priv_share_digests.clone();
+        back.zk_signer_share_digests = old.zk_signer_share_digests.clone();
+        assert_eq!(back, old);
+    }
 
     #[test]
     fn public_round_trips() {
