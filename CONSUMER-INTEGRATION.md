@@ -99,12 +99,12 @@ the roll short. The onboarding input is the module's `attested_readers` map; see
 decides *which* partners and *which* public bucket a consumer reads. Each entry names
 the partner set, its audiences, and the public-material location. That map, and the set
 of environment names it defines, is the single source of truth in
-`crates/cofhe-keys/src/envs.rs`. Adding an env is a code change plus a consumer rebuild,
+`crates/cofhe-keys/src/envs/`. Adding an env is a code change plus a consumer rebuild,
 by design.
 
 > **The `mainnet` entry holds the real partner set: six key-share holders, threshold
 > 3.** Every slot holds a real project id and number, so a consumer builds its partner
-> list and reads normally. Changing a holder is an `envs.rs` edit → consumer rebuild →
+> list and reads normally. Changing a holder is an `envs/` edit → consumer rebuild →
 > new digests re-pinned in the `keygen-partners` var-file → all six partners re-apply
 > `partner/`. There is no path that skips the rebuild.
 >
