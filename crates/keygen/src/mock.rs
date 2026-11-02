@@ -22,7 +22,7 @@ pub fn boot() -> Result<()> {
         "mock-partner-2".to_string(),
         "mock-partner-3".to_string(),
     ];
-    let (partner_shares, artifacts, public) = keygen::generate(&partner_ids, 3, 2)?;
+    let (partner_shares, artifacts, public) = keygen::generate(&partner_ids, 2)?;
     info!(
         partners = partner_shares.len(),
         fhe_priv_share_bytes = partner_shares[0].fhe_priv_share.len(),
