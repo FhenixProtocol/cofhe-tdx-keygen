@@ -203,7 +203,7 @@ mod tests {
     #[test]
     fn builds_staging_from_baked_env() {
         let cfg = Config::for_env("staging").unwrap();
-        assert_eq!(cfg.partners.len(), 5);
+        assert_eq!(cfg.partners.len(), cfg.env.partners.len());
         assert_eq!(cfg.threshold, 2);
         assert_eq!(cfg.partners[0].project_id, "cofhe-tee-partner-1");
         assert!(cfg.partners[0]

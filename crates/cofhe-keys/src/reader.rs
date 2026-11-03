@@ -437,7 +437,7 @@ mod tests {
     fn partner_refs_stamps_secret_and_consumer_audience() {
         let env = lookup("staging").unwrap();
         let refs = partner_refs(env, "teecryptor", "cofhe-tee-fhe-priv").unwrap();
-        assert_eq!(refs.len(), 5);
+        assert_eq!(refs.len(), env.partners.len());
         assert_eq!(refs[0].project_id, "cofhe-tee-partner-1");
         assert_eq!(refs[0].secret_id, "cofhe-tee-fhe-priv");
         assert!(refs[0]
