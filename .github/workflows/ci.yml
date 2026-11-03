@@ -111,6 +111,24 @@ jobs:
       - name: Image boots
         run: ./scripts/check-image-boots.sh keygen:ci
 
+  # Advisories, licenses, bans and sources for the whole workspace, as in the consumer
+  # repos. A new RustSec advisory fails here, not later in a consumer.
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install toolchain
+        run: rustup show
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny
+
+      - name: cargo-deny (licenses, bans, advisories, sources)
+        run: cargo deny check
+
   # Full-history secret scan. History is clean at publication; this gate keeps
   # every commit clean after the repo is public.
   secret-scan:
