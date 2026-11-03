@@ -21,6 +21,11 @@ pub(super) const PARTNERS: &[EnvPartner] = &[
         wip_pool_audience: "//iam.googleapis.com/projects/467122964772/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
         keygen_write_audience: "//iam.googleapis.com/projects/467122964772/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
     },
+    EnvPartner {
+        project_id: "cofhe-tee-partner-5",
+        wip_pool_audience: "//iam.googleapis.com/projects/926992419891/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
+        keygen_write_audience: "//iam.googleapis.com/projects/926992419891/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
+    },
 ];
 
 pub(super) const STAGING: EnvConfig = EnvConfig {
@@ -29,9 +34,9 @@ pub(super) const STAGING: EnvConfig = EnvConfig {
     public_prefix: "generator/keys/versionized",
     public_zone: 0,
     shamir_threshold: 2,
-    share_version: v(10),
-    // Drill pass 1: partner-5 leaves. The sources are the five partners at v9,
-    // written in full because partner-5 is no longer in `PARTNERS`.
+    share_version: v(11),
+    // Drill pass 2: partner-5 rejoins. The sources are partners 1-4 at v10,
+    // written in full so that an edit of `PARTNERS` cannot change them.
     reshare_from: Some(ReshareSource {
         partners: &[
             SourcePartner {
@@ -66,17 +71,9 @@ pub(super) const STAGING: EnvConfig = EnvConfig {
                 },
                 share_version: None,
             },
-            SourcePartner {
-                partner: EnvPartner {
-                    project_id: "cofhe-tee-partner-5",
-                    wip_pool_audience: "//iam.googleapis.com/projects/926992419891/locations/global/workloadIdentityPools/cofhe-tee-reader-pool",
-                    keygen_write_audience: "//iam.googleapis.com/projects/926992419891/locations/global/workloadIdentityPools/cofhe-tee-keygen-pool/providers/cofhe-tee-keygen-provider",
-                },
-                share_version: None,
-            },
         ],
         shamir_threshold: 2,
-        share_version: v(9),
+        share_version: v(10),
         legacy_manifest: false,
         decrypt_signer_address: "0x78727a198308732baadd7db5339ed95d50110b76",
         zk_signer_address: "0xe12a73f5aaca9ae79bda8754a485fe99fef3fac3",
